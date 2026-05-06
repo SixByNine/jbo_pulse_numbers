@@ -12,7 +12,8 @@ import numpy as np
 
 try:
     import matplotlib
-    matplotlib.use('Agg')  # non-interactive backend
+    if "--interactive" not in sys.argv and os.environ.get("MPLBACKEND") is None:
+        matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     HAS_MATPLOTLIB = True
 except ImportError:
@@ -28,6 +29,30 @@ except ImportError:
 
 
 import run_enterprise.spectrum.cholspec as cholspec
+
+
+def ensure_interactive_matplotlib_backend():
+    if not HAS_MATPLOTLIB:
+        raise RuntimeError("Interactive mode requires matplotlib")
+
+    backend = matplotlib.get_backend().lower()
+    if "agg" not in backend:
+        return
+
+    candidate_backends = ["MacOSX", "TkAgg", "QtAgg", "Qt5Agg"]
+    backend_errors = []
+    for candidate in candidate_backends:
+        try:
+            plt.switch_backend(candidate)
+            return
+        except Exception as exc:
+            backend_errors.append(f"{candidate}: {exc}")
+
+    message = "; ".join(backend_errors)
+    raise RuntimeError(
+        "Interactive mode requested, but matplotlib is using a non-interactive Agg backend and no interactive backend could be loaded. "
+        f"Tried: {message}"
+    )
 
 
 
@@ -64,12 +89,21 @@ def parse_args():
     parser.add_argument("--covariance-scale", type=float, default=1.0, help="scale factor applied to the GP covariance matrix to tune predictive confidence")
     parser.add_argument("--wrap-min", type=int, default=-10, help="minimum integer wrap hypothesis")
     parser.add_argument("--wrap-max", type=int, default=10, help="maximum integer wrap hypothesis")
+    parser.add_argument("--wrap-prior-sigma", type=float, default=0.0, help="Gaussian prior width for integer wraps; non-positive disables the prior")
+    parser.add_argument("--particle-min-keep", type=int, default=16, help="minimum number of particles to retain after pruning when available")
     parser.add_argument("--particle-limit", type=int, default=128, help="maximum number of retained particles after pruning")
     parser.add_argument("--outlier-prob", type=float, default=0.05, help="mixture weight assigned to the broad outlier component")
     parser.add_argument("--outlier-sigma", type=float, default=3.0, help="sigma of the broad outlier Gaussian in phase units")
     parser.add_argument("--time-tolerance", type=float, default=1e-6, help="matching tolerance for identifying new TOAs in days")
     parser.add_argument("--output", default=None, help="optional CSV file for per-observation diagnostics")
     parser.add_argument("--output-tim", default=None, help="optional output tim file with outlier comments and -pnadd wrap annotations")
+    parser.add_argument("--interactive", action="store_true", help="launch a basic interactive matplotlib UI for manual constraints and re-solving")
+    parser.add_argument(
+        "--mean-poly-order",
+        type=int,
+        default=-1,
+        help="polynomial order for GP parametric mean (0=constant, 1=linear, 2=quadratic; negative disables and uses zero-mean)",
+    )
     return parser.parse_args()
 
 
@@ -84,35 +118,12 @@ def read_gp_parameters(par_path):
             if fields[0] in {"TNRedAmp", "TNRedGam", "F0"}:
                 parameters[fields[0]] = float(fields[1])
 
-    missing = {"TNRedAmp", "TNRedGam"} - set(parameters)
+    missing = {"TNRedAmp", "TNRedGam", "F0"} - set(parameters)
     if missing:
         missing_names = ", ".join(sorted(missing))
         raise ValueError(f"Missing required red-noise parameters in par file: {missing_names}")
     return parameters
 
-
-def build_combined_tim(tim_path, newtim_path, combined_path):
-    with open(combined_path, "w") as output_handle:
-        with open(tim_path) as trusted_handle:
-            for line in trusted_handle:
-                stripped = line.rstrip()
-                if stripped.startswith("FORMAT"):
-                    output_handle.write(line if line.endswith("\n") else line + "\n")
-                    continue
-                if stripped:
-                    output_handle.write(f"{stripped} -ds GOOD\n")
-                else:
-                    output_handle.write(line)
-
-        with open(newtim_path) as new_handle:
-            for line in new_handle:
-                if line.startswith("FORMAT"):
-                    continue
-                stripped = line.rstrip()
-                if stripped:
-                    output_handle.write(f"{stripped} -ds NEW\n")
-                else:
-                    output_handle.write(line)
 
 
 def run_tempo2_exportres(par_path, tim_path, working_directory):
@@ -136,6 +147,7 @@ def run_tempo2_exportres(par_path, tim_path, working_directory):
         raise RuntimeError(exc.stderr.strip() or exc.stdout.strip() or "tempo2 exportres failed") from exc
     out_res = os.path.join(working_directory, "out.res")
     data = np.loadtxt(out_res, ndmin=2, usecols=(0, 1, 2))
+    print(data[:,1])
     if data.shape[1] < 3:
         raise ValueError("tempo2 out.res does not contain the expected phase columns")
     return {
@@ -194,7 +206,15 @@ def systematic_resample(normalized_weights, rng):
     return indexes
 
 
-def predictive_observation_stats(candidate_index, observed_indices, observed_values, covariance, noise_variance):
+def build_polynomial_design(times, order, reference_time, time_scale):
+    centered = (np.asarray(times, dtype=float) - reference_time) / time_scale
+    columns = [np.ones_like(centered)]
+    for degree in range(1, order + 1):
+        columns.append(centered ** degree)
+    return np.column_stack(columns)
+
+
+def predictive_observation_stats(candidate_index, observed_indices, observed_values, covariance, noise_variance, all_times, mean_poly_order):
     prior_mean = 0.0
     prior_variance = covariance[candidate_index, candidate_index] + noise_variance[candidate_index]
     if not observed_indices:
@@ -204,14 +224,54 @@ def predictive_observation_stats(candidate_index, observed_indices, observed_val
     observed = np.asarray(observed_values, dtype=float)
     system_covariance = covariance[np.ix_(history, history)] + np.diag(noise_variance[history])
     cross_covariance = covariance[candidate_index, history]
-    solved_mean = np.linalg.solve(system_covariance, observed)
+
+    if mean_poly_order < 0:
+        solved_mean = np.linalg.solve(system_covariance, observed)
+        solved_cross = np.linalg.solve(system_covariance, cross_covariance)
+        predictive_mean = float(cross_covariance.dot(solved_mean))
+        predictive_variance = float(prior_variance - cross_covariance.dot(solved_cross))
+        return predictive_mean, max(predictive_variance, 1e-12)
+
+    reference_time = float(np.min(all_times))
+    time_span = float(np.max(all_times) - np.min(all_times))
+    time_scale = max(time_span, 1.0)
+
+    history_times = np.asarray(all_times, dtype=float)[history]
+    candidate_time = np.asarray([all_times[candidate_index]], dtype=float)
+    design_history = build_polynomial_design(history_times, mean_poly_order, reference_time, time_scale)
+    design_candidate = build_polynomial_design(candidate_time, mean_poly_order, reference_time, time_scale)[0]
+
     solved_cross = np.linalg.solve(system_covariance, cross_covariance)
-    predictive_mean = float(cross_covariance.dot(solved_mean))
-    predictive_variance = float(prior_variance - cross_covariance.dot(solved_cross))
+
+    # GLS estimate of the polynomial mean coefficients.
+    whitened_design = np.linalg.solve(system_covariance, design_history)
+    fisher = design_history.T.dot(whitened_design)
+    fisher_inv = np.linalg.pinv(fisher)
+    beta_hat = fisher_inv.dot(design_history.T.dot(np.linalg.solve(system_covariance, observed)))
+
+    residual = observed - design_history.dot(beta_hat)
+    solved_residual = np.linalg.solve(system_covariance, residual)
+    predictive_mean = float(design_candidate.dot(beta_hat) + cross_covariance.dot(solved_residual))
+
+    mean_uncertainty = design_candidate - design_history.T.dot(solved_cross)
+    predictive_variance = float(
+        prior_variance
+        - cross_covariance.dot(solved_cross)
+        + mean_uncertainty.dot(fisher_inv).dot(mean_uncertainty)
+    )
     return predictive_mean, max(predictive_variance, 1e-12)
 
 
-def evaluate_wrap_candidates(observation, predictive_mean, predictive_variance, wrap_options, cumulitive_wrap, outlier_probability, outlier_sigma):
+def evaluate_wrap_candidates(
+    observation,
+    predictive_mean,
+    predictive_variance,
+    wrap_options,
+    cumulitive_wrap,
+    outlier_probability,
+    outlier_sigma,
+    wrap_prior_sigma,
+):
     signal_log_weights = []
     mixture_log_weights = []
     candidate_rows = []
@@ -219,11 +279,14 @@ def evaluate_wrap_candidates(observation, predictive_mean, predictive_variance, 
     signal_scale = math.log(max(1.0 - outlier_probability, 1e-12))
     outlier_scale = math.log(max(outlier_probability, 1e-12))
     outlier_variance = outlier_sigma ** 2
+    use_wrap_prior = wrap_prior_sigma is not None and wrap_prior_sigma > 0.0
+    wrap_prior_variance = wrap_prior_sigma ** 2 if use_wrap_prior else None
 
     for wrap in wrap_options:
         unwrapped_value = observation + wrap + cumulitive_wrap
-        signal_log = signal_scale + gaussian_logpdf(unwrapped_value, predictive_mean, predictive_variance)
-        outlier_log = outlier_scale + gaussian_logpdf(unwrapped_value, 0.0, outlier_variance)
+        wrap_prior_log = gaussian_logpdf(wrap, 0.0, wrap_prior_variance) if use_wrap_prior else 0.0
+        signal_log = signal_scale + gaussian_logpdf(unwrapped_value, predictive_mean, predictive_variance) + wrap_prior_log
+        outlier_log = outlier_scale + gaussian_logpdf(unwrapped_value, 0.0, outlier_variance) + wrap_prior_log
         mixture_log = np.logaddexp(signal_log, outlier_log)
         signal_log_weights.append(signal_log)
         mixture_log_weights.append(mixture_log)
@@ -231,6 +294,7 @@ def evaluate_wrap_candidates(observation, predictive_mean, predictive_variance, 
             {
                 "wrap": int(wrap),
                 "unwrapped_value": float(unwrapped_value),
+                "wrap_prior_log": float(wrap_prior_log),
                 "signal_log": float(signal_log),
                 "outlier_log": float(outlier_log),
                 "mixture_log": float(mixture_log),
@@ -248,77 +312,77 @@ def evaluate_wrap_candidates(observation, predictive_mean, predictive_variance, 
     return candidate_rows, inlier_probability, float(marginal_log_likelihood)
 
 
-def prune_particles(particles, particle_limit):
-    ordered = sorted(particles, key=lambda particle: particle.log_weight, reverse=True)
-    return ordered[:particle_limit]
+def get_step_constraint(constraints, step_number):
+    if constraints is None:
+        return {}
+    return dict(constraints.get(step_number, {}))
 
 
-def resample_particles(particles, particle_limit, rng):
-    log_weights = [particle.log_weight for particle in particles]
-    normalized_weights, log_normalizer = normalize_log_weights(log_weights)
-    ess = 1.0 / np.sum(normalized_weights ** 2)
-    if ess >= 0.5 * len(particles) or len(particles) <= 1:
-        return particles, ess
+def get_constrained_wrap_options(wrap_options, constraint):
+    forced_wrap = constraint.get("forced_wrap")
+    if forced_wrap is None:
+        return wrap_options
+    return np.asarray([int(forced_wrap)], dtype=int)
 
-    particle_count = min(len(particles), particle_limit)
-    indices = systematic_resample(normalized_weights, rng)[:particle_count]
-    resampled = []
-    reset_weight = log_normalizer - math.log(particle_count)
-    for index in indices:
-        original = particles[index]
-        resampled.append(
-            Particle(
-                assignments=list(original.assignments),
-                observed_indices=list(original.observed_indices),
-                observed_values=list(original.observed_values),
-                log_weight=reset_weight,
-                diagnostics=list(original.diagnostics),
-            )
+
+def validate_step_constraint(constraint):
+    if not constraint:
+        return
+    if constraint.get("force_inlier") and constraint.get("force_outlier"):
+        raise ValueError("A point cannot be forced to be both inlier and outlier")
+
+
+def process_single_observation(
+    step_number,
+    observation_index,
+    particles,
+    wrapped_phase,
+    phase_sigma,
+    all_times,
+    covariance,
+    noise_variance,
+    wrap_options,
+    wrap_to_index,
+    args,
+    constraints=None,
+):
+    constraint = get_step_constraint(constraints, step_number)
+    validate_step_constraint(constraint)
+    constrained_wrap_options = get_constrained_wrap_options(wrap_options, constraint)
+    observation = wrapped_phase[observation_index]
+
+    proposal_particles = []
+    per_wrap_log_weights = np.full(len(wrap_options), -np.inf, dtype=float)
+    inlier_log_weight_total = -np.inf
+    proposal_log_weight_total = -np.inf
+
+    for particle in particles:
+        predictive_mean, predictive_variance = predictive_observation_stats(
+            observation_index,
+            particle.observed_indices,
+            particle.observed_values,
+            covariance,
+            noise_variance,
+            all_times,
+            args.mean_poly_order,
         )
-    return resampled, ess
+        cumulative_wrap = np.sum(particle.assignments) if particle.assignments else 0
+        candidate_rows, inlier_probability, marginal_log_likelihood = evaluate_wrap_candidates(
+            observation,
+            predictive_mean,
+            predictive_variance,
+            constrained_wrap_options,
+            cumulative_wrap,
+            args.outlier_prob,
+            args.outlier_sigma,
+            args.wrap_prior_sigma,
+        )
 
+        for candidate in candidate_rows:
+            wrap = candidate["wrap"]
+            wrap_index = wrap_to_index[wrap]
 
-def associate_phases(all_times, wrapped_phase, phase_sigma, trusted_mask, new_indices, covariance, wrap_options, args):
-    rng = np.random.default_rng(12345)
-    noise_variance = np.square(phase_sigma)
-    trusted_indices = np.flatnonzero(trusted_mask)
-    trusted_values = wrapped_phase[trusted_mask]
-    base_particle = Particle([], trusted_indices.tolist(), trusted_values.tolist(), 0.0, [])
-    particles = [base_particle]
-    diagnostics = []
-    wrap_to_index = {int(wrap): index for index, wrap in enumerate(wrap_options)}
-
-    for step_number, observation_index in tqdm(enumerate(new_indices), total=len(new_indices), desc="Processing new observations"):
-        previous_log_total = logsumexp([particle.log_weight for particle in particles])
-        proposal_particles = []
-        per_wrap_log_weights = np.full(len(wrap_options), -np.inf, dtype=float)
-        inlier_log_weight_total = -np.inf
-        proposal_log_weight_total = -np.inf
-        observation = wrapped_phase[observation_index]
-
-        for particle in particles:
-            predictive_mean, predictive_variance = predictive_observation_stats(
-                observation_index,
-                particle.observed_indices,
-                particle.observed_values,
-                covariance,
-                noise_variance,
-            )
-            cumulitive_wrap = np.sum(particle.assignments) if particle.assignments else 0
-            candidate_rows, inlier_probability, marginal_log_likelihood = evaluate_wrap_candidates(
-                observation,
-                predictive_mean,
-                predictive_variance,
-                wrap_options,
-                cumulitive_wrap,
-                args.outlier_prob,
-                args.outlier_sigma,
-            )
-
-            for candidate in candidate_rows:
-                wrap = candidate["wrap"]
-                wrap_index = wrap_to_index[wrap]
-
+            if not constraint.get("force_outlier"):
                 inlier_log_weight = particle.log_weight + candidate["signal_log"]
                 proposal_log_weight_total = np.logaddexp(proposal_log_weight_total, inlier_log_weight)
                 inlier_log_weight_total = np.logaddexp(inlier_log_weight_total, inlier_log_weight)
@@ -343,49 +407,124 @@ def associate_phases(all_times, wrapped_phase, phase_sigma, trusted_mask, new_in
                         ],
                     )
                 )
-            wrap=0
-            wrap_index = wrap_to_index[wrap]
-            outlier_log_weight = particle.log_weight + candidate["outlier_log"]
-            proposal_log_weight_total = np.logaddexp(proposal_log_weight_total, outlier_log_weight)
-            per_wrap_log_weights[wrap_index] = np.logaddexp(per_wrap_log_weights[wrap_index], outlier_log_weight)
-            proposal_particles.append(
-                Particle(
-                    assignments=particle.assignments + [wrap],
-                    observed_indices=list(particle.observed_indices),
-                    observed_values=list(particle.observed_values),
-                    log_weight=outlier_log_weight,
-                    diagnostics=particle.diagnostics
-                    + [
-                        {
-                            "time": float(all_times[observation_index]),
-                            "predictive_mean": float(predictive_mean),
-                            "predictive_sigma": float(math.sqrt(predictive_variance)),
-                            "inlier_probability": float(inlier_probability),
-                            "marginal_log_likelihood": float(marginal_log_likelihood),
-                            "branch_is_outlier": 1,
-                            "step": int(step_number),
-                        }
-                    ],
+
+            if not constraint.get("force_inlier") and wrap==0:
+                outlier_log_weight = particle.log_weight + candidate["outlier_log"]
+                proposal_log_weight_total = np.logaddexp(proposal_log_weight_total, outlier_log_weight)
+                per_wrap_log_weights[wrap_index] = np.logaddexp(per_wrap_log_weights[wrap_index], outlier_log_weight)
+                proposal_particles.append(
+                    Particle(
+                        assignments=particle.assignments + [wrap],
+                        observed_indices=list(particle.observed_indices),
+                        observed_values=list(particle.observed_values),
+                        log_weight=outlier_log_weight,
+                        diagnostics=particle.diagnostics
+                        + [
+                            {
+                                "time": float(all_times[observation_index]),
+                                "predictive_mean": float(predictive_mean),
+                                "predictive_sigma": float(math.sqrt(predictive_variance)),
+                                "inlier_probability": float(inlier_probability),
+                                "marginal_log_likelihood": float(marginal_log_likelihood),
+                                "branch_is_outlier": 1,
+                                "step": int(step_number),
+                            }
+                        ],
+                    )
                 )
-            )
 
-        if not proposal_particles:
-            raise RuntimeError("No proposal particles were generated during phase association")
+    if not proposal_particles:
+        raise ValueError(f"Constraints left no valid branches at step {step_number}")
 
-        particles = prune_particles(proposal_particles, args.particle_limit)
-        particles, ess = resample_particles(particles, args.particle_limit, rng)
+    return {
+        "proposal_particles": proposal_particles,
+        "per_wrap_log_weights": per_wrap_log_weights,
+        "inlier_log_weight_total": inlier_log_weight_total,
+        "proposal_log_weight_total": proposal_log_weight_total,
+        "observation": observation,
+        "observation_index": observation_index,
+    }
 
-        wrap_posteriors = np.exp(per_wrap_log_weights - proposal_log_weight_total)
-        aggregated_inlier = float(np.exp(inlier_log_weight_total - proposal_log_weight_total))
-        aggregated_marginal = float(proposal_log_weight_total - previous_log_total)
+
+def score(particle):
+    return particle.log_weight
+
+def keep_until_mass(particles, p_threshold):
+    if not particles:
+        return []
+
+    threshold = min(max(float(p_threshold), 0.0), 1.0)
+    log_weights = np.asarray([particle.log_weight for particle in particles], dtype=float)
+    log_total = logsumexp(log_weights)
+    if not np.isfinite(log_total):
+        return [particles[0]]
+
+    normalized_weights = np.exp(log_weights - log_total)
+    cumulative = np.cumsum(normalized_weights)
+    cutoff_index = int(np.searchsorted(cumulative, threshold, side="left"))
+    cutoff_index = min(max(cutoff_index, 0), len(particles) - 1)
+    return particles[: cutoff_index + 1]
+
+def prune_particles(particles, particle_limit, particle_min_keep):
+    
+    ordered = sorted(particles, key=lambda particle: score(particle), reverse=True)
+
+    max_score= score(ordered[0]) if ordered else -np.inf
+    delta = 100.0 
+    trimmed = [p for p in ordered if score(p) >= max_score - delta]
+    if len(ordered) < particle_min_keep:
+        trimmed = ordered[:particle_min_keep]
+
+    min_keep = max(1, int(particle_min_keep))
+    max_keep = max(1, int(particle_limit))
+    keep_count = min(max_keep, max(min_keep, len(trimmed)))
+    return trimmed[:keep_count]
+
+
+
+
+def associate_phases(all_times, wrapped_phase, phase_sigma, trusted_mask, new_indices, covariance, wrap_options, args, constraints=None):
+    noise_variance = np.square(phase_sigma)
+    trusted_indices = np.flatnonzero(trusted_mask)
+    trusted_values = wrapped_phase[trusted_mask]
+    base_particle = Particle([], trusted_indices.tolist(), trusted_values.tolist(), 0.0, [])
+    particles = [base_particle]
+    diagnostics = []
+    wrap_to_index = {int(wrap): index for index, wrap in enumerate(wrap_options)}
+
+    for step_number, observation_index in tqdm(enumerate(new_indices), total=len(new_indices), desc="Processing new observations"):
+        previous_log_total = logsumexp([particle.log_weight for particle in particles])
+        step_result = process_single_observation(
+            step_number,
+            observation_index,
+            particles,
+            wrapped_phase,
+            phase_sigma,
+            all_times,
+            covariance,
+            noise_variance,
+            wrap_options,
+            wrap_to_index,
+            args,
+            constraints=constraints,
+        )
+
+        particles = prune_particles(step_result["proposal_particles"], args.particle_limit, args.particle_min_keep)
+        normalized_weights, _ = normalize_log_weights([particle.log_weight for particle in particles])
+        ess = 1.0 / np.sum(normalized_weights ** 2)
+        wrap_posteriors = np.exp(step_result["per_wrap_log_weights"] - step_result["proposal_log_weight_total"])
+        aggregated_inlier = float(np.exp(step_result["inlier_log_weight_total"] - step_result["proposal_log_weight_total"]))
+        aggregated_marginal = float(step_result["proposal_log_weight_total"] - previous_log_total)
         map_wrap_index = int(np.argmax(wrap_posteriors))
         map_wrap = int(wrap_options[map_wrap_index])
-
+        # print(f"Step {step_number + 1}/{len(new_indices)}: time={all_times[observation_index]:.8f} map_wrap={map_wrap} map_wrap_prob={wrap_posteriors[map_wrap_index]:.6f} inlier_prob={aggregated_inlier:.6f} marginal_log_likelihood={aggregated_marginal:.6f} ess={ess:.1f} particles={len(particles)}")
+        # for particle in particles[:32]:
+        #     print(f"  {particle}")
 
         diagnostics.append(
             {
-                "time": float(all_times[observation_index]),
-                "wrapped_phase": float(observation),
+                "time": float(all_times[step_result["observation_index"]]),
+                "wrapped_phase": float(step_result["observation"]),
                 "phase_sigma": float(phase_sigma[observation_index]),
                 "map_wrap": map_wrap,
                 "map_wrap_probability": float(wrap_posteriors[map_wrap_index]),
@@ -514,6 +653,20 @@ def write_updated_tim(input_tim_path, output_tim_path, diagnostics, tolerance):
             output_handle.write(updated + "\n")
 
 
+def solve_with_constraints(all_times, wrapped_phase, phase_sigma, trusted_mask, new_indices, covariance, wrap_options, args, constraints=None):
+    return associate_phases(
+        all_times,
+        wrapped_phase,
+        phase_sigma,
+        trusted_mask,
+        new_indices,
+        covariance,
+        wrap_options,
+        args,
+        constraints=constraints,
+    )
+
+
 def print_summary(best_particle, diagnostics):
     print("index time map_wrap wrap_probability inlier_probability predictive_mean predictive_sigma outlier")
     for index, row in enumerate(diagnostics, start=1):
@@ -571,7 +724,7 @@ def plot_diagnostics(times, wrapped_phase, diagnostics, trusted_mask, new_indice
         cbar1.set_label('inlier probability', fontsize=10)
     
     if np.any(is_outlier):
-        ax1.scatter(diag_times[is_outlier], diag_wrapped[is_outlier],
+        ax1.scatter(diag_times[is_outlier], diag_unwrapped[is_outlier],
                    marker='X', s=120, c='red', edgecolors='darkred', linewidths=2,
                    label='new (outlier)', zorder=6)
     
@@ -620,6 +773,343 @@ def plot_diagnostics(times, wrapped_phase, diagnostics, trusted_mask, new_indice
     print(f"wrote_plot {plot_path}")
 
 
+class InteractivePhaseUI:
+    def __init__(
+        self,
+        times,
+        wrapped_phase,
+        phase_sigma,
+        trusted_mask,
+        new_indices,
+        covariance,
+        wrap_options,
+        args,
+        newtim_path,
+        output_path,
+        output_tim_path,
+        best_particle,
+        diagnostics,
+    ):
+        self.times = np.asarray(times)
+        self.wrapped_phase = np.asarray(wrapped_phase)
+        self.phase_sigma = np.asarray(phase_sigma)
+        self.trusted_mask = np.asarray(trusted_mask)
+        self.new_indices = np.asarray(new_indices)
+        self.covariance = covariance
+        self.wrap_options = wrap_options
+        self.args = args
+        self.newtim_path = newtim_path
+        self.output_path = output_path
+        self.output_tim_path = output_tim_path
+        self.best_particle = best_particle
+        self.diagnostics = diagnostics
+        self.constraints = {}
+        self.selected_step = None
+        self.hover_step = None
+        self.dirty = False
+        self.last_error = None
+        self.saved = False
+
+        self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(14, 10))
+        self.status_text = self.fig.text(0.01, 0.01, "", fontsize=9)
+        self.fig.canvas.mpl_connect("motion_notify_event", self.on_mouse_move)
+        self.fig.canvas.mpl_connect("key_press_event", self.on_key_press)
+        self.fig.suptitle(
+            "Interactive Phase Association\n"
+            "move mouse near point | i: force inlier | o: force outlier | =/-: adjust wrap | x: clear wrap | u: clear constraints | r: re-solve | s: save | q: quit",
+            fontsize=12,
+        )
+        self.redraw()
+
+    def current_constraint(self):
+        active_step = self.active_step()
+        if active_step is None:
+            return None
+        return self.constraints.setdefault(active_step, {})
+
+    def active_step(self):
+        if self.hover_step is not None:
+            return self.hover_step
+        return self.selected_step
+
+    def get_nearest_step(self, event):
+        if event.inaxes not in {self.ax1, self.ax2} or event.xdata is None or event.ydata is None:
+            return None
+
+        diag_times = np.array([row["time"] for row in self.diagnostics])
+        if len(diag_times) == 0:
+            return None
+
+        diag_map_wraps = np.array([row["map_wrap"] for row in self.diagnostics])
+        diag_wrapped = np.array([row["wrapped_phase"] for row in self.diagnostics])
+        diag_pred_means = np.array([row["predictive_mean"] for row in self.diagnostics])
+        diag_unwrapped = diag_wrapped + np.cumsum(diag_map_wraps)
+        residuals = diag_unwrapped - diag_pred_means
+
+        x_values = diag_times
+        if event.inaxes is self.ax1:
+            y_values = diag_unwrapped
+        else:
+            y_values = residuals
+
+        x_span = max(float(np.max(x_values) - np.min(x_values)), 1e-12)
+        y_span = max(float(np.max(y_values) - np.min(y_values)), 1e-12)
+        dx = (x_values - event.xdata) / x_span
+        dy = (y_values - event.ydata) / y_span
+        distances = dx * dx + dy * dy
+        return int(np.argmin(distances))
+
+    def set_status(self, message):
+        self.status_text.set_text(message)
+
+    def mark_dirty(self, message):
+        self.dirty = True
+        self.set_status(f"{message} Press 'r' to re-solve.")
+        self.redraw()
+
+    def on_mouse_move(self, event):
+        nearest_step = self.get_nearest_step(event)
+        if nearest_step == self.hover_step:
+            return
+        self.hover_step = nearest_step
+        if nearest_step is not None:
+            self.selected_step = nearest_step
+            self.set_status(f"Current point {nearest_step} at time {self.diagnostics[nearest_step]['time']:.8f}")
+        self.redraw()
+
+    def on_key_press(self, event):
+        key = event.key
+        if key == "q":
+            plt.close(self.fig)
+            return
+
+        active_step = self.get_nearest_step(event)
+        if active_step is not None:
+            self.hover_step = active_step
+            self.selected_step = active_step
+        else:
+            active_step = self.active_step()
+
+        if active_step is None and key not in {"r", "s"}:
+            self.set_status("Move the mouse near a point first.")
+            self.redraw()
+            return
+
+        if key == "i":
+            constraint = self.current_constraint()
+            constraint["force_inlier"] = True
+            constraint["force_outlier"] = False
+            self.mark_dirty(f"Point {active_step} forced inlier.")
+        elif key == "o":
+            constraint = self.current_constraint()
+            constraint["force_outlier"] = True
+            constraint["force_inlier"] = False
+            self.mark_dirty(f"Point {active_step} forced outlier.")
+        elif key == "=":
+            constraint = self.current_constraint()
+            constraint["forced_wrap"] = int(constraint.get("forced_wrap", 0)) + 1
+            self.mark_dirty(f"Point {active_step} forced wrap set to {constraint['forced_wrap']}.")
+        elif key == "-":
+            constraint = self.current_constraint()
+            constraint["forced_wrap"] = int(constraint.get("forced_wrap", 0)) - 1
+            self.mark_dirty(f"Point {active_step} forced wrap set to {constraint['forced_wrap']}.")
+        elif key == "x":
+            constraint = self.current_constraint()
+            if "forced_wrap" in constraint:
+                del constraint["forced_wrap"]
+            if not constraint:
+                self.constraints.pop(active_step, None)
+            self.mark_dirty(f"Cleared forced wrap for point {active_step}.")
+        elif key == "u":
+            self.constraints.pop(active_step, None)
+            self.mark_dirty(f"Cleared all constraints for point {active_step}.")
+        elif key == "r":
+            self.solve_current()
+        elif key == "s":
+            self.save_outputs()
+
+    def solve_current(self):
+        try:
+            self.best_particle, self.diagnostics = solve_with_constraints(
+                self.times,
+                self.wrapped_phase,
+                self.phase_sigma,
+                self.trusted_mask,
+                self.new_indices,
+                self.covariance,
+                self.wrap_options,
+                self.args,
+                constraints=self.constraints,
+            )
+            self.dirty = False
+            self.last_error = None
+            self.set_status(f"Solved with {len(self.constraints)} constrained points.")
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.set_status(f"Solve failed: {exc}")
+        self.redraw()
+
+    def save_outputs(self):
+        if self.dirty:
+            self.solve_current()
+            if self.last_error is not None:
+                return
+        write_diagnostics(self.diagnostics, self.output_path)
+        write_updated_tim(self.newtim_path, self.output_tim_path, self.diagnostics, self.args.time_tolerance)
+        plot_diagnostics(self.times, self.wrapped_phase, self.diagnostics, self.trusted_mask, self.new_indices, self.output_path)
+        self.saved = True
+        self.set_status(f"Saved outputs to {self.output_path} and {self.output_tim_path}")
+        self.redraw()
+
+    def redraw(self):
+        self.ax1.clear()
+        self.ax2.clear()
+
+        diag_times = np.array([row["time"] for row in self.diagnostics])
+        diag_map_wraps = np.array([row["map_wrap"] for row in self.diagnostics])
+        diag_wrapped = np.array([row["wrapped_phase"] for row in self.diagnostics])
+        diag_pred_means = np.array([row["predictive_mean"] for row in self.diagnostics])
+        diag_pred_sigmas = np.array([row["predictive_sigma"] for row in self.diagnostics])
+        diag_inliers = np.array([row["inlier_probability"] for row in self.diagnostics])
+        diag_outlier_flags = np.array([row["outlier_flag"] for row in self.diagnostics])
+        diag_unwrapped = diag_wrapped + np.cumsum(diag_map_wraps)
+        residuals = diag_unwrapped - diag_pred_means
+
+        trusted_idx = np.where(self.trusted_mask)[0]
+        if len(trusted_idx) > 0:
+            self.ax1.scatter(
+                self.times[trusted_idx],
+                self.wrapped_phase[trusted_idx],
+                alpha=0.6,
+                s=30,
+                c="gray",
+                label="trusted (wrapped)",
+                zorder=2,
+            )
+
+        is_outlier = diag_outlier_flags > 0
+        is_inlier = ~is_outlier
+
+        if np.any(is_inlier):
+            self.scatter_top = self.ax1.scatter(
+                diag_times[is_inlier],
+                diag_unwrapped[is_inlier],
+                c=diag_inliers[is_inlier],
+                cmap="RdYlGn",
+                vmin=0,
+                vmax=1,
+                s=60,
+                edgecolors="blue",
+                linewidths=1.5,
+                label="new (inlier)",
+                zorder=4,
+            )
+        else:
+            self.scatter_top = self.ax1.scatter([], [])
+
+        if np.any(is_outlier):
+            self.ax1.scatter(
+                diag_times[is_outlier],
+                diag_unwrapped[is_outlier],
+                marker="X",
+                s=120,
+                c="red",
+                edgecolors="darkred",
+                linewidths=2,
+                label="new (outlier)",
+                zorder=5,
+            )
+            self.ax2.scatter(
+                diag_times[is_outlier],
+                residuals[is_outlier],
+                marker="X",
+                s=120,
+                c="red",
+                edgecolors="darkred",
+                linewidths=2,
+                label="new (outlier)",
+                zorder=5,
+            )
+
+        self.scatter_bottom = self.ax2.scatter(
+            diag_times,
+            residuals,
+            c=diag_inliers,
+            cmap="RdYlGn",
+            vmin=0,
+            vmax=1,
+            s=50,
+            edgecolors="blue",
+            linewidths=1.0,
+            label="new points",
+            zorder=4,
+        )
+
+        pred_upper = diag_pred_means + diag_pred_sigmas
+        pred_lower = diag_pred_means - diag_pred_sigmas
+        self.ax1.plot(diag_times, diag_pred_means, "g-", linewidth=2, label="predictive mean", alpha=0.8, zorder=3)
+
+        self.ax1.plot(diag_times, diag_pred_means+1, "g:", linewidth=1, alpha=0.5, zorder=3)
+        self.ax1.plot(diag_times, diag_pred_means-1, "g:", linewidth=1, alpha=0.5, zorder=3)
+
+
+        self.ax1.fill_between(diag_times, pred_lower, pred_upper, color="green", alpha=0.2, label="±1σ band", zorder=1)
+        self.ax2.fill_between(diag_times, -diag_pred_sigmas, diag_pred_sigmas, color="green", alpha=0.2, label="±1σ band", zorder=1)
+        self.ax2.axhline(y=0, color="green", linestyle="--", linewidth=1.5, alpha=0.7, zorder=2)
+
+        for step_index, constraint in self.constraints.items():
+            time_value = diag_times[step_index]
+            y_value = diag_unwrapped[step_index]
+            edge_color = "orange"
+            if constraint.get("force_outlier"):
+                edge_color = "red"
+            elif constraint.get("force_inlier"):
+                edge_color = "limegreen"
+            self.ax1.scatter([time_value], [y_value], s=180, facecolors="none", edgecolors=edge_color, linewidths=2.0, zorder=6)
+            wrap_value = constraint.get("forced_wrap")
+            if wrap_value is not None:
+                self.ax1.text(time_value, y_value, f" {wrap_value:+d}", color=edge_color, fontsize=9, zorder=7)
+
+        highlight_step = self.active_step()
+        if highlight_step is not None and 0 <= highlight_step < len(diag_times):
+            self.ax1.scatter(
+                [diag_times[highlight_step]],
+                [diag_unwrapped[highlight_step]],
+                s=220,
+                facecolors="none",
+                edgecolors="black",
+                linewidths=2.5,
+                zorder=8,
+            )
+            self.ax2.scatter(
+                [diag_times[highlight_step]],
+                [residuals[highlight_step]],
+                s=220,
+                facecolors="none",
+                edgecolors="black",
+                linewidths=2.5,
+                zorder=8,
+            )
+
+        self.ax1.set_xlabel("time (days)")
+        self.ax1.set_ylabel("phase (unwrapped)")
+        self.ax1.set_title("Interactive Phase Association")
+        self.ax1.grid(True, alpha=0.3)
+        self.ax1.legend(loc="best", fontsize=9)
+
+        self.ax2.set_xlabel("time (days)")
+        self.ax2.set_ylabel("residual (unwrapped obs - predicted mean)")
+        self.ax2.set_title("Residuals")
+        self.ax2.grid(True, alpha=0.3)
+        self.ax2.legend(loc="best", fontsize=9)
+
+        self.fig.canvas.draw_idle()
+
+    def run(self):
+        plt.show()
+        return self.saved, self.best_particle, self.diagnostics
+
+
 
 def main():
     args = parse_args()
@@ -642,11 +1132,10 @@ def main():
     wrap_options = np.arange(args.wrap_min, args.wrap_max + 1, dtype=int)
 
     with tempfile.TemporaryDirectory(prefix="phase_assoc_") as working_directory:
-        combined_tim = os.path.join(working_directory, "combined.tim")
-        build_combined_tim(tim_path, newtim_path, combined_tim)
+
         
         trusted = run_tempo2_exportres(par_path, tim_path, working_directory)
-        combined = run_tempo2_exportres(par_path, combined_tim, working_directory)
+        combined = run_tempo2_exportres(par_path, newtim_path, working_directory)
 
     new_mask = identify_new_observations(combined["times"], trusted["times"], args.time_tolerance)
     if not np.any(new_mask):
@@ -659,7 +1148,10 @@ def main():
     trusted_mask = ~new_mask[order]
     new_indices = np.flatnonzero(new_mask[order])
 
-    covariance = args.covariance_scale * cholspec.getC(
+    wrapped_phase = wrapped_phase - np.mean(wrapped_phase[trusted_mask])
+
+    F0_hz = gp_parameters["F0"]
+    covariance = args.covariance_scale * F0_hz**2 * cholspec.getC(
         times,
         gp_parameters["TNRedAmp"],
         gp_parameters["TNRedGam"],
@@ -683,6 +1175,28 @@ def main():
     output_tim_path = args.output_tim
     if output_tim_path is None:
         output_tim_path = os.path.splitext(newtim_path)[0] + ".phase_association.tim"
+
+    if args.interactive:
+        ensure_interactive_matplotlib_backend()
+        ui = InteractivePhaseUI(
+            times,
+            wrapped_phase,
+            phase_sigma,
+            trusted_mask,
+            new_indices,
+            covariance,
+            wrap_options,
+            args,
+            newtim_path,
+            output_path,
+            output_tim_path,
+            best_particle,
+            diagnostics,
+        )
+        saved, best_particle, diagnostics = ui.run()
+        if not saved:
+            print("interactive_session_closed_without_saving")
+            return
 
     write_diagnostics(diagnostics, output_path)
     write_updated_tim(newtim_path, output_tim_path, diagnostics, args.time_tolerance)
