@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import argparse
 import csv
 import importlib.util
@@ -26,23 +27,7 @@ except ImportError:
         return iterable
 
 
-def _load_cholspec():
-    """Load cholspec directly from file without triggering package initialization."""
-    # Navigate from utilities/ -> run_enterprise/ -> spectrum/cholspec.py
-    utilities_dir = os.path.dirname(os.path.abspath(__file__))
-    run_enterprise_dir = os.path.dirname(utilities_dir)
-    cholspec_path = os.path.join(run_enterprise_dir, 'run_enterprise', 'spectrum', 'cholspec.py')
-    
-    if not os.path.exists(cholspec_path):
-        raise FileNotFoundError(f"Could not find cholspec.py at {cholspec_path}")
-    
-    spec = importlib.util.spec_from_file_location('cholspec', cholspec_path)
-    cholspec_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cholspec_module)
-    return cholspec_module
-
-
-cholspec = _load_cholspec()
+import run_enterprise.spectrum.cholspec as cholspec
 
 
 
