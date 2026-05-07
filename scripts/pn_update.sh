@@ -1,5 +1,7 @@
 #!/bin/bash
 
+#set -euo pipefail
+
  ~/change_data_symlink_to_vraid1
 
 if [[ -n "$1" ]] ; then
@@ -8,8 +10,14 @@ else
     psrdir=$(pwd)
 fi
 
+scriptdir=$(dirname "$(readlink -f "$0")")
+
 cd $psrdir
 psrdir=$(pwd)
+pulsar_name=$(basename "$psrdir")
+
+web_sync_target="${PN_WEB_SYNC_TARGET:-}"
+interactive_flag="0"
 
 std=dfb_data/1520.std
 if [[ -e dfb_data/dfb1520.std ]] ; then
@@ -181,9 +189,48 @@ if [[ -n "$newfiles" ]] ; then
     fi
     
     tempo2 -output add_pulseNumber -f update.par extended.tim
-    echo     extrapolate_pulse_numbers.py --par update.par --tim current.tim --newtim withpn.tim --wrap-max 2 --wrap-min -2 --outlier-prob 0.1 --particle-limit 32 --time-tol 1e-6 --covariance-scale 32 --interactive
 
-    extrapolate_pulse_numbers.py --par update.par --tim current.tim --newtim withpn.tim --wrap-max 2 --wrap-min -2 --outlier-prob 0.1 --particle-limit 32 --time-tol 1e-6 --covariance-scale 32 --interactive
+    run_id="${pulsar_name}_$(date -u +'%Y%m%d_%H%M%S')"
+    stage_root="$psrdir/updates/review_runs"
+    stage_dir="$stage_root/$pulsar_name/$run_id"
+    mkdir -p "$stage_dir"
+    manifest_path="$stage_dir/manifest.json"
+    marker_path="$stage_dir/COMPLETE"
+    extrapolate_cmd=(
+        python ${scriptdir}/extrapolate_pulse_numbers.py
+        --par update.par
+        --tim current.tim
+        --newtim withpn.tim
+        --wrap-max 2
+        --wrap-min -2
+        --outlier-prob 0.1
+        --particle-limit 32
+        --time-tol 1e-6
+        --covariance-scale 32
+        --run-id "$run_id"
+        --pulsar "$pulsar_name"
+        --output-dir "$stage_dir"
+        --manifest-output "$manifest_path"
+        --complete-marker "$marker_path"
+    )
+    if [[ "$interactive_flag" == "1" ]]; then
+        extrapolate_cmd+=(--interactive)
+    fi
+    echo "${extrapolate_cmd[@]}"
+    "${extrapolate_cmd[@]}"
+
+    if [[ -n "$web_sync_target" ]]; then
+        # Sync stage_root to target, filtering to only this run; rsync creates directories automatically.
+        rsync -avP \
+          --include="/$pulsar_name/" \
+          --include="/$pulsar_name/$run_id/" \
+          --include="/$pulsar_name/$run_id/**" \
+          --exclude="*" \
+          "$stage_root/" "$web_sync_target/"
+        echo "rsynced_run $web_sync_target/$pulsar_name/$run_id/"
+    else
+        echo "rsync_skipped_set_PN_WEB_SYNC_TARGET_to_enable"
+    fi
 
 else
     echo "No new files"

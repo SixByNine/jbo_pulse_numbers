@@ -2,11 +2,13 @@
 import argparse
 import csv
 import importlib.util
+import json
 import math
 import os
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 
 import numpy as np
 
@@ -95,8 +97,14 @@ def parse_args():
     parser.add_argument("--outlier-prob", type=float, default=0.05, help="mixture weight assigned to the broad outlier component")
     parser.add_argument("--outlier-sigma", type=float, default=3.0, help="sigma of the broad outlier Gaussian in phase units")
     parser.add_argument("--time-tolerance", type=float, default=1e-6, help="matching tolerance for identifying new TOAs in days")
+    parser.add_argument("--time-tol", dest="time_tolerance", type=float, help="alias for --time-tolerance")
     parser.add_argument("--output", default=None, help="optional CSV file for per-observation diagnostics")
     parser.add_argument("--output-tim", default=None, help="optional output tim file with outlier comments and -pnadd wrap annotations")
+    parser.add_argument("--output-dir", default=None, help="output directory for CSV/TIM/PNG when --output/--output-tim are not set")
+    parser.add_argument("--run-id", default=None, help="optional external run identifier used for downstream review workflows")
+    parser.add_argument("--pulsar", default=None, help="optional pulsar identifier for manifest metadata")
+    parser.add_argument("--manifest-output", default=None, help="optional JSON output path for per-run summary metadata")
+    parser.add_argument("--complete-marker", default=None, help="optional marker file written after all outputs are complete")
     parser.add_argument("--interactive", action="store_true", help="launch a basic interactive matplotlib UI for manual constraints and re-solving")
     parser.add_argument(
         "--mean-poly-order",
@@ -681,7 +689,7 @@ def print_summary(best_particle, diagnostics):
 def plot_diagnostics(times, wrapped_phase, diagnostics, trusted_mask, new_indices, output_path):
     """Generate diagnostic plot showing residuals, predictions, and outlier flags."""
     if not HAS_MATPLOTLIB:
-        return
+        return None
     
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
     
@@ -771,6 +779,35 @@ def plot_diagnostics(times, wrapped_phase, diagnostics, trusted_mask, new_indice
     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"wrote_plot {plot_path}")
+    return plot_path
+
+
+def infer_pulsar_name(par_path, explicit_name=None):
+    if explicit_name:
+        return explicit_name
+    return os.path.splitext(os.path.basename(par_path))[0]
+
+
+def infer_run_id(explicit_run_id=None):
+    if explicit_run_id:
+        return explicit_run_id
+    return f"run_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
+
+
+def write_manifest(manifest_path, payload):
+    if manifest_path is None:
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(manifest_path)), exist_ok=True)
+    with open(manifest_path, "w") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+
+
+def write_complete_marker(marker_path):
+    if marker_path is None:
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(marker_path)), exist_ok=True)
+    with open(marker_path, "w") as handle:
+        handle.write("complete\n")
 
 
 class InteractivePhaseUI:
@@ -1170,11 +1207,25 @@ def main():
 
     output_path = args.output
     if output_path is None:
-        output_path = os.path.splitext(newtim_path)[0] + ".phase_association.csv"
+        if args.output_dir:
+            os.makedirs(args.output_dir, exist_ok=True)
+            output_path = os.path.join(
+                args.output_dir,
+                os.path.basename(os.path.splitext(newtim_path)[0] + ".phase_association.csv"),
+            )
+        else:
+            output_path = os.path.splitext(newtim_path)[0] + ".phase_association.csv"
 
     output_tim_path = args.output_tim
     if output_tim_path is None:
-        output_tim_path = os.path.splitext(newtim_path)[0] + ".phase_association.tim"
+        if args.output_dir:
+            os.makedirs(args.output_dir, exist_ok=True)
+            output_tim_path = os.path.join(
+                args.output_dir,
+                os.path.basename(os.path.splitext(newtim_path)[0] + ".phase_association.tim"),
+            )
+        else:
+            output_tim_path = os.path.splitext(newtim_path)[0] + ".phase_association.tim"
 
     if args.interactive:
         ensure_interactive_matplotlib_backend()
@@ -1200,12 +1251,58 @@ def main():
 
     write_diagnostics(diagnostics, output_path)
     write_updated_tim(newtim_path, output_tim_path, diagnostics, args.time_tolerance)
-    plot_diagnostics(times, wrapped_phase, diagnostics, trusted_mask, new_indices, output_path)
+    plot_path = plot_diagnostics(times, wrapped_phase, diagnostics, trusted_mask, new_indices, output_path)
     print_summary(best_particle, diagnostics)
-    print(f"trusted_observations {int(np.sum(trusted_mask))}")
-    print(f"new_observations {int(len(new_indices))}")
+    trusted_count = int(np.sum(trusted_mask))
+    new_count = int(len(new_indices))
+    print(f"trusted_observations {trusted_count}")
+    print(f"new_observations {new_count}")
     print(f"wrote_diagnostics {output_path}")
     print(f"wrote_output_tim {output_tim_path}")
+
+    run_id = infer_run_id(args.run_id)
+    pulsar_name = infer_pulsar_name(par_path, args.pulsar)
+    manifest = {
+        "run_id": run_id,
+        "pulsar": pulsar_name,
+        "created_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "inputs": {
+            "par": par_path,
+            "tim": tim_path,
+            "newtim": newtim_path,
+        },
+        "parameters": {
+            "fc_yr": args.fc_yr,
+            "covariance_scale": args.covariance_scale,
+            "wrap_min": args.wrap_min,
+            "wrap_max": args.wrap_max,
+            "wrap_prior_sigma": args.wrap_prior_sigma,
+            "particle_min_keep": args.particle_min_keep,
+            "particle_limit": args.particle_limit,
+            "outlier_prob": args.outlier_prob,
+            "outlier_sigma": args.outlier_sigma,
+            "time_tolerance": args.time_tolerance,
+            "mean_poly_order": args.mean_poly_order,
+            "interactive": bool(args.interactive),
+        },
+        "summary": {
+            "trusted_observations": trusted_count,
+            "new_observations": new_count,
+            "best_wrap_sequence": best_particle.assignments,
+            "best_particle_log_weight": float(best_particle.log_weight),
+        },
+        "outputs": {
+            "diagnostics_csv": os.path.basename(output_path),
+            "output_tim": os.path.basename(output_tim_path),
+            "diagnostic_plot": os.path.basename(plot_path) if plot_path is not None else None,
+        },
+    }
+    write_manifest(args.manifest_output, manifest)
+    write_complete_marker(args.complete_marker)
+    if args.manifest_output:
+        print(f"wrote_manifest {args.manifest_output}")
+    if args.complete_marker:
+        print(f"wrote_complete_marker {args.complete_marker}")
 
 
 

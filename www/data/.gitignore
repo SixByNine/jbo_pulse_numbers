@@ -1,0 +1,7 @@
+# Runtime data only
+runs/*
+!runs/.gitkeep
+
+db/*.sqlite
+db/*.sqlite-*
+!db/.gitkeep
