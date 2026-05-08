@@ -10,18 +10,19 @@ if [[ -z "${TIMING_API_KEY:-}" ]]; then
     exit 2
 fi
 
-state_url="${TIMING_WEB_STATE_URL:-}"
-artifact_url="${TIMING_WEB_ARTIFACT_URL:-}"
-merge_url="${TIMING_WEB_MERGE_URL:-}"
-pending_pulsars_url="${TIMING_WEB_PENDING_PULSARS_URL:-}"
-if [[ -n "${TIMING_WEB_BASE_URL:-}" ]]; then
-    state_url="${state_url:-${TIMING_WEB_BASE_URL%/}/api/state.php}"
-    artifact_url="${artifact_url:-${TIMING_WEB_BASE_URL%/}/api/artifact.php}"
-    merge_url="${merge_url:-${TIMING_WEB_BASE_URL%/}/api/merge.php}"
-    pending_pulsars_url="${pending_pulsars_url:-${TIMING_WEB_BASE_URL%/}/api/pulsars_pending_merge.php}"
+
+if [[ -z "${TIMING_WEB_BASE_URL:-}" ]]; then
+    echo "error: TIMING_WEB_BASE_URL is required"
+    exit 2
 fi
+
+state_url="${state_url:-${TIMING_WEB_BASE_URL%/}/api/state.php}"
+artifact_url="${artifact_url:-${TIMING_WEB_BASE_URL%/}/api/artifact.php}"
+merge_url="${merge_url:-${TIMING_WEB_BASE_URL%/}/api/merge.php}"
+pending_pulsars_url="${pending_pulsars_url:-${TIMING_WEB_BASE_URL%/}/api/pulsars_pending_merge.php}"
+
 if [[ -z "$state_url" || -z "$artifact_url" || -z "$merge_url" || -z "$pending_pulsars_url" ]]; then
-    echo "error: set TIMING_WEB_BASE_URL or all of TIMING_WEB_STATE_URL/TIMING_WEB_ARTIFACT_URL/TIMING_WEB_MERGE_URL/TIMING_WEB_PENDING_PULSARS_URL"
+    echo "error: set TIMING_WEB_BASE_URL"
     exit 2
 fi
 

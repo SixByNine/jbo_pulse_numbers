@@ -6,10 +6,12 @@
 usage() {
     echo "Usage: $0 [-i|--interactive] [-n|--no-upload] [-f|--force] [pulsar_directory_or_name]"
 }
+pulsar_base_dir="${TIMING_PULSAR_BASE_DIR:-$(pwd)}"
 
 interactive_flag="0"
 upload_flag="1"
 force_flag="0"
+clear_manual_flag="0"
 psrdir=""
 
 while [[ $# -gt 0 ]] ; do
@@ -24,6 +26,10 @@ while [[ $# -gt 0 ]] ; do
             ;;
         -f|--force)
             force_flag="1"
+            shift
+            ;;
+        --clear-manual)
+            clear_manual_flag="1"
             shift
             ;;
         -h|--help)
@@ -45,7 +51,12 @@ while [[ $# -gt 0 ]] ; do
                 usage >&2
                 exit 2
             fi
-            psrdir="$1"
+                psr="$1"
+                psrdir=$pulsar_base_dir/$psr
+                if [[ ! -d "$psrdir" ]]; then
+                    echo "Pulsar directory not found: $psrdir" >&2
+                    exit 2
+                fi
             shift
             ;;
     esac
@@ -61,6 +72,7 @@ if [[ -z "$psrdir" ]] ; then
     psrdir=$(pwd)
 fi
 
+
 scriptdir=$(dirname "$(readlink -f "$0")")
 
 cd $psrdir
@@ -68,9 +80,13 @@ cd $psrdir
 psrdir=$(pwd)
 pulsar_name=$(basename "$psrdir")
 
-manual_status=0
-python3 "$scriptdir/manual_followup.py" "$pulsar_name" || manual_status=$?
-if [[ "$manual_status" == "0" ]] ; then
+if [[ "$clear_manual_flag" == "1" ]]; then
+    echo "Clearing manual follow-up status for $pulsar_name"
+    "$scriptdir/manual_followup.py" --clear "$pulsar_name"
+fi
+
+manual_status=$(python3 "$scriptdir/manual_followup.py" "$pulsar_name") || exit $?
+if [[ "$manual_status" == *"manual_active"* ]] ; then
     if [[ "$force_flag" != "1" ]] ; then
         echo "Manual follow-up is active for $pulsar_name. Aborting. Use --force to continue without upload." >&2
         exit 1
@@ -79,8 +95,6 @@ if [[ "$manual_status" == "0" ]] ; then
         echo "Manual follow-up is active for $pulsar_name. Continuing because --force was used; upload disabled."
     fi
     upload_flag="0"
-elif [[ "$manual_status" != "1" ]] ; then
-    exit "$manual_status"
 fi
 
 $scriptdir/apply_web_updates.sh "$psrdir"
@@ -138,6 +152,7 @@ fi
 echo "Last DFB file: $last_dfb"
 echo "Last ROACH file: $last_roach"
 
+trusted_file="best.tim"
 
 # If any new DFB files, we haven't updated since 2023, so the old data should be checked for dlyfix issues.
 if [[ -n "$newfiles_DFB" ]] ; then
@@ -185,27 +200,25 @@ if [[ -n "$newfiles_DFB" ]] ; then
         fi
 
         toa1=$3
-        
+        wflag=""
         delta_pn=$(echo "$pn $F0 $toa1 $line2" | awk '{printf("%0.12f", ($4-$7)*86400.0*$3)}')
+        # if the absolute value of delta_pn is larger than 100 we might want to flag this to not be trusted
+        if [[ $(echo "$delta_pn" | awk '{print ($1 < -100 || $1 > 100)}') -eq 1 ]]; then
+            wflag="-distrust delta_pn_large"
+        fi
         pn_new=$(echo "$pn $delta_pn" | awk '
         function nint(x) { return (x >= 0) ? int(x + 0.5) : int(x - 0.5) }
         { printf("-pn %d", nint($2 + $3)) }')
-        echo "$line $pn_new $half"
+        echo "$line $pn_new $half $wflag"
         
     done > jbdfb_pn.tim
-    backname=best.tim.`date +'%Y-%m-%dT%H:%M:%S'`
 
     wc -l best.tim
-
-    cp best.tim $backname
-    cp -f $backname best.tim # Deal with files owned by someone else
-
-
     grep -v jbdfb best.tim > tmp.tim
-    sort -nk3 tmp.tim jbdfb_pn.tim > best.tim
+    sort -nk3 tmp.tim jbdfb_pn.tim > jbdfb_fix.tim
 
-
-    wc -l best.tim
+    wc -l jbdfb_fix.tim
+    trusted_file="jbdfb_fix.tim"
 
 
 fi
@@ -222,8 +235,8 @@ if [[ -n "$newfiles_DFB" ]] || [[ -n "$newfiles_ROACH" ]] ; then
 
 
     wd=$(pwd)
-    cd dfb_data
     echo "Checking dlyfix"
+    cd dfb_data
     fixfiles_DFB=""
     for i in $newfiles_DFB ; do
         b=$(basename $i)
@@ -232,7 +245,7 @@ if [[ -n "$newfiles_DFB" ]] || [[ -n "$newfiles_ROACH" ]] ; then
             rm $fixed
         fi
         echo "DFB data... $i"
-        ~/dlyfix/dlyfix $i -e dlyfix > /dev/null
+        ~/dlyfix/dlyfix $b -e dlyfix > /dev/null
         if [[ -e $fixed ]] ; then
             echo "Not delay fixed $i"
             fixfiles_DFB="$fixfiles_DFB dfb_data/$fixed"
@@ -248,15 +261,16 @@ if [[ -n "$newfiles_DFB" ]] || [[ -n "$newfiles_ROACH" ]] ; then
     rm updates/*
 
     pat -A SIS -f tempo2 -s $std $newfiles | sed -e "s:jbdfb:jbdfb -be jbdfb:g" | sed -e "s:roach:roach -be jbroach:g" | grep -v nan > updates/jdfb_update.tim
-    cat best.tim updates/jdfb_update.tim > updates/extended.tim
+    cat $trusted_file updates/jdfb_update.tim > updates/extended.tim
 
+    grep -v -F -- "-distrust" $trusted_file > updates/trusted.tim
 
     cd updates
-    cp ../best.tim current.tim
+    
 
     if [[ -e ../enterprise_log3_sub3/J1941+2525_run.par.post ]] ; then
         cp ../enterprise_log3_sub3/J1941+2525_run.par.post update.par
-        tempo2 -f update.par current.tim -newpar
+        tempo2 -f update.par trusted.tim -newpar
         mv new.par update.par
     elif [[ -e ../analysis/final.par ]] ; then
         cp ../analysis/final.par update.par
@@ -314,13 +328,12 @@ if [[ -n "$newfiles_DFB" ]] || [[ -n "$newfiles_ROACH" ]] ; then
     extrapolate_cmd=(
         python ${scriptdir}/extrapolate_pulse_numbers.py
         --par update.par
-        --tim current.tim
+        --tim trusted.tim
         --newtim withpn.tim
         --wrap-max 2
         --wrap-min -2
         --outlier-prob 0.02
         --particle-limit 128
-        --time-tol 1e-6
         --covariance-scale 32
         --mean-poly-order 2
         --run-id "$run_id"
@@ -346,6 +359,8 @@ if [[ -n "$newfiles_DFB" ]] || [[ -n "$newfiles_ROACH" ]] ; then
           --exclude="*" \
           "$stage_root/" "$web_sync_target/"
         echo "rsynced_run $web_sync_target/$pulsar_name/$run_id/"
+        
+                "$scriptdir/trigger_import.sh" "$pulsar_name" "$run_id"
     else
         echo "Run not uploaded. marker_exists=$([[ -e "$marker_path" ]] && echo "yes" || echo "no") web_sync_target_set=$([[ -n "$web_sync_target" ]] && echo "yes" || echo "no") upload_flag=$upload_flag"
     fi

@@ -123,7 +123,7 @@ def main():
             )
             return 0
         print(f"manual_clear pulsar={args.pulsar}")
-        return 1
+        return 0
 
     manual_pulsars = payload.get("manual_pulsars") or []
     for row in manual_pulsars:

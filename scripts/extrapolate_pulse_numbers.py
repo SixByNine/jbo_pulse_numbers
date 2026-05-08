@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import csv
-import importlib.util
 import json
 import math
 import os
@@ -96,8 +95,6 @@ def parse_args():
     parser.add_argument("--particle-limit", type=int, default=128, help="maximum number of retained particles after pruning")
     parser.add_argument("--outlier-prob", type=float, default=0.05, help="mixture weight assigned to the broad outlier component")
     parser.add_argument("--outlier-sigma", type=float, default=3.0, help="sigma of the broad outlier Gaussian in phase units")
-    parser.add_argument("--time-tolerance", type=float, default=1e-6, help="matching tolerance for identifying new TOAs in days")
-    parser.add_argument("--time-tol", dest="time_tolerance", type=float, help="alias for --time-tolerance")
     parser.add_argument("--output", default=None, help="optional CSV file for per-observation diagnostics")
     parser.add_argument("--output-tim", default=None, help="optional output tim file with outlier comments and -pnadd wrap annotations")
     parser.add_argument("--output-dir", default=None, help="output directory for CSV/TIM/PNG when --output/--output-tim are not set")
@@ -350,7 +347,7 @@ def evaluate_wrap_candidates(
     predictive_mean,
     predictive_variance,
     wrap_options,
-    cumulitive_wrap,
+    baseline_wrap_value,
     outlier_probability,
     outlier_sigma,
     wrap_prior_sigma,
@@ -366,7 +363,7 @@ def evaluate_wrap_candidates(
     wrap_prior_variance = wrap_prior_sigma ** 2 if use_wrap_prior else None
 
     for wrap in wrap_options:
-        unwrapped_value = observation + wrap + cumulitive_wrap
+        unwrapped_value = observation + wrap + baseline_wrap_value
         wrap_prior_log = gaussian_logpdf(wrap, 0.0, wrap_prior_variance) if use_wrap_prior else 0.0
         signal_log = signal_scale + gaussian_logpdf(unwrapped_value, predictive_mean, predictive_variance) + wrap_prior_log
         outlier_log = outlier_scale + gaussian_logpdf(unwrapped_value, 0.0, outlier_variance) + wrap_prior_log
@@ -381,6 +378,7 @@ def evaluate_wrap_candidates(
                 "signal_log": float(signal_log),
                 "outlier_log": float(outlier_log),
                 "mixture_log": float(mixture_log),
+                "baseline_wrap": float(baseline_wrap_value),
             }
         )
 
@@ -450,12 +448,13 @@ def process_single_observation(
             args.mean_poly_order,
         )
         cumulative_wrap = np.sum(particle.assignments) if particle.assignments else 0
+        baseline_wrap_value = cumulative_wrap
         candidate_rows, inlier_probability, marginal_log_likelihood = evaluate_wrap_candidates(
             observation,
             predictive_mean,
             predictive_variance,
             constrained_wrap_options,
-            cumulative_wrap,
+            baseline_wrap_value,
             args.outlier_prob,
             args.outlier_sigma,
             args.wrap_prior_sigma,
@@ -480,6 +479,7 @@ def process_single_observation(
                         + [
                             {
                                 "time": float(all_times[observation_index]),
+                                "baseline_wrap": float(baseline_wrap_value),
                                 "predictive_mean": float(predictive_mean),
                                 "predictive_sigma": float(math.sqrt(predictive_variance)),
                                 "inlier_probability": float(inlier_probability),
@@ -505,6 +505,7 @@ def process_single_observation(
                         + [
                             {
                                 "time": float(all_times[observation_index]),
+                                "baseline_wrap": float(baseline_wrap_value),
                                 "predictive_mean": float(predictive_mean),
                                 "predictive_sigma": float(math.sqrt(predictive_variance)),
                                 "inlier_probability": float(inlier_probability),
@@ -625,6 +626,7 @@ def associate_phases(
                 "phase_sigma": float(phase_sigma[observation_index]),
                 "identifier": "" if identifiers is None else str(identifiers[observation_index]),
                 "frequency_mhz": float("nan") if frequency_mhz is None else float(frequency_mhz[observation_index]),
+                "baseline_wrap": float("nan"),
                 "map_wrap": map_wrap,
                 "map_wrap_probability": float(wrap_posteriors[map_wrap_index]),
                 "inlier_probability": aggregated_inlier,
@@ -643,6 +645,7 @@ def associate_phases(
         final_diag = best_particle.diagnostics[step_index]
         row["map_wrap"] = final_wrap
         row["map_wrap_probability"] = row["wrap_probabilities"].get(str(final_wrap), 0.0)
+        row["baseline_wrap"] = float(final_diag["baseline_wrap"])
         row["predictive_mean"] = float(final_diag["predictive_mean"])
         row["predictive_sigma"] = float(final_diag["predictive_sigma"])
         row["outlier_flag"] = int(final_diag["branch_is_outlier"])
@@ -656,6 +659,7 @@ def write_diagnostics(rows, output_path):
         "phase_sigma",
         "identifier",
         "frequency_mhz",
+        "baseline_wrap",
         "map_wrap",
         "map_wrap_probability",
         "inlier_probability",
@@ -694,30 +698,35 @@ def parse_tim_line(line):
         return None, None, None
 
 
-def upsert_pnadd(line, wrap):
-    tokens = line.split()
-    cleaned = []
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        if token == "-pnadd":
-            index += 2
-            continue
-        cleaned.append(token)
-        index += 1
+def update_pulse_number(line, wrap):
+    if wrap == 0:
+        return line
+    else:
+        tokens = line.split()
+        cleaned = []
+        index = 0
+        
+        while index < len(tokens):
+            token = tokens[index]
+            if token == "-pn":
+                current_pn = np.int64(tokens[index + 1])
+                index += 2
+                continue
+            cleaned.append(token)
+            index += 1
 
-    if wrap != 0:
-        cleaned.extend(["-pnadd", str(-int(wrap))])
-    return " ".join(cleaned)
+        cleaned.extend(["-pn", str(current_pn-np.int64(wrap))])
+        return " ".join(cleaned)
 
 
-def write_updated_tim(input_tim_path, output_tim_path, diagnostics, tolerance):
+def write_updated_tim(input_tim_path, output_tim_path, diagnostics):
     decisions = [
         {
             "time": float(row["time"]),
             "identifier": str(row.get("identifier", "")),
             "frequency_mhz": float(row.get("frequency_mhz", float("nan"))),
-            "wrap": int(row["map_wrap"]),
+            "baseline_wrap": int(round(float(row.get("baseline_wrap", 0.0)))),
+            "map_wrap": int(row["map_wrap"]),
             "outlier": int(row["outlier_flag"]),
             "used": False,
         }
@@ -770,7 +779,8 @@ def write_updated_tim(input_tim_path, output_tim_path, diagnostics, tolerance):
             decision = decisions[best_index]
             decision["used"] = True
 
-            updated = upsert_pnadd(stripped, decision["wrap"])
+            total_wrap = decision["baseline_wrap"] + decision["map_wrap"]
+            updated = update_pulse_number(stripped, total_wrap)
             if decision["outlier"]:
                 updated = "C " + updated
             else:
@@ -835,6 +845,7 @@ def plot_diagnostics(times, phase_sigma, wrapped_phase, diagnostics, trusted_mas
     # Extract diagnostic info for new observations
     diag_times = np.array([d["time"] for d in diagnostics])
     diag_map_wraps = np.array([d["map_wrap"] for d in diagnostics])
+    diag_baseline_wraps = np.array([d.get("baseline_wrap", 0.0) for d in diagnostics])
     diag_wrapped = np.array([d["wrapped_phase"] for d in diagnostics])
     diag_phase_sigma = np.array([d["phase_sigma"] for d in diagnostics])
     diag_pred_means = np.array([d["predictive_mean"] for d in diagnostics])
@@ -842,8 +853,8 @@ def plot_diagnostics(times, phase_sigma, wrapped_phase, diagnostics, trusted_mas
     diag_inliers = np.array([d["inlier_probability"] for d in diagnostics])
     diag_outlier_flags = np.array([d["outlier_flag"] for d in diagnostics])
     
-    # Compute unwrapped phase for new observations: wrapped + map_wrap
-    diag_unwrapped = diag_wrapped + np.cumsum(diag_map_wraps)
+    # Compute unwrapped phase from persisted baseline + local wrap decision.
+    diag_unwrapped = diag_wrapped + diag_baseline_wraps + diag_map_wraps
     
     # Compute residuals: unwrapped - predicted_mean
     residuals = diag_unwrapped - diag_pred_means
@@ -1031,9 +1042,10 @@ class InteractivePhaseUI:
             return None
 
         diag_map_wraps = np.array([row["map_wrap"] for row in self.diagnostics])
+        diag_baseline_wraps = np.array([row.get("baseline_wrap", 0.0) for row in self.diagnostics])
         diag_wrapped = np.array([row["wrapped_phase"] for row in self.diagnostics])
         diag_pred_means = np.array([row["predictive_mean"] for row in self.diagnostics])
-        diag_unwrapped = diag_wrapped + np.cumsum(diag_map_wraps)
+        diag_unwrapped = diag_wrapped + diag_baseline_wraps + diag_map_wraps
         residuals = diag_unwrapped - diag_pred_means
 
         x_values = diag_times
@@ -1146,7 +1158,7 @@ class InteractivePhaseUI:
             if self.last_error is not None:
                 return
         write_diagnostics(self.diagnostics, self.output_path)
-        write_updated_tim(self.newtim_path, self.output_tim_path, self.diagnostics, self.args.time_tolerance)
+        write_updated_tim(self.newtim_path, self.output_tim_path, self.diagnostics)
         plot_diagnostics(
             self.times,
             self.wrapped_phase,
@@ -1166,12 +1178,13 @@ class InteractivePhaseUI:
 
         diag_times = np.array([row["time"] for row in self.diagnostics])
         diag_map_wraps = np.array([row["map_wrap"] for row in self.diagnostics])
+        diag_baseline_wraps = np.array([row.get("baseline_wrap", 0.0) for row in self.diagnostics])
         diag_wrapped = np.array([row["wrapped_phase"] for row in self.diagnostics])
         diag_pred_means = np.array([row["predictive_mean"] for row in self.diagnostics])
         diag_pred_sigmas = np.array([row["predictive_sigma"] for row in self.diagnostics])
         diag_inliers = np.array([row["inlier_probability"] for row in self.diagnostics])
         diag_outlier_flags = np.array([row["outlier_flag"] for row in self.diagnostics])
-        diag_unwrapped = diag_wrapped + np.cumsum(diag_map_wraps)
+        diag_unwrapped = diag_wrapped + diag_baseline_wraps + diag_map_wraps
         residuals = diag_unwrapped - diag_pred_means
 
         trusted_idx = np.where(self.trusted_mask)[0]
@@ -1430,7 +1443,7 @@ def main():
             return
 
     write_diagnostics(diagnostics, output_path)
-    write_updated_tim(newtim_path, output_tim_path, diagnostics, args.time_tolerance)
+    write_updated_tim(newtim_path, output_tim_path, diagnostics)
     plot_path = plot_diagnostics(
         times,
         phase_sigma,
@@ -1470,7 +1483,6 @@ def main():
             "particle_limit": args.particle_limit,
             "outlier_prob": args.outlier_prob,
             "outlier_sigma": args.outlier_sigma,
-            "time_tolerance": args.time_tolerance,
             "mean_poly_order": args.mean_poly_order,
             "interactive": bool(args.interactive),
         },

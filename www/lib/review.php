@@ -249,6 +249,37 @@ function import_all_runs(array $config)
     return $results;
 }
 
+function import_single_run(array $config, $pulsar, $runId)
+{
+    $cleanPulsar = trim((string) $pulsar);
+    $cleanRunId = trim((string) $runId);
+    if ($cleanPulsar === '' || $cleanRunId === '') {
+        throw new RuntimeException('missing_pulsar_or_run_id');
+    }
+
+    $dataRoot = realpath((string) $config['data_root']);
+    if ($dataRoot === false || !is_dir($dataRoot)) {
+        throw new RuntimeException('invalid_data_root');
+    }
+
+    $runDir = $dataRoot . '/' . $cleanPulsar . '/' . $cleanRunId;
+    $manifestPath = $runDir . '/manifest.json';
+    $completeMarkerPath = $runDir . '/COMPLETE';
+
+    $resolvedRunDir = realpath($runDir);
+    if ($resolvedRunDir === false || strpos($resolvedRunDir, $dataRoot . '/') !== 0) {
+        throw new RuntimeException('run_not_found');
+    }
+    if (!is_file($manifestPath)) {
+        throw new RuntimeException('manifest_not_found');
+    }
+    if (!is_file($completeMarkerPath)) {
+        throw new RuntimeException('complete_marker_not_found');
+    }
+
+    return import_manifest($config, $manifestPath);
+}
+
 function get_pulsar_rule(array $config, $pulsar)
 {
     $pdo = db_conn($config);
