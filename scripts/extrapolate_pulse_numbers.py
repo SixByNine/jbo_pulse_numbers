@@ -112,6 +112,7 @@ def parse_args():
         default=-1,
         help="polynomial order for GP parametric mean (0=constant, 1=linear, 2=quadratic; negative disables and uses zero-mean)",
     )
+    parser.add_argument("--ephindex", default=None, help="optional JBO/AGL style ephindex.dat file giving dates of possible glitches")
     return parser.parse_args()
 
 
@@ -132,7 +133,22 @@ def read_gp_parameters(par_path):
         raise ValueError(f"Missing required red-noise parameters in par file: {missing_names}")
     return parameters
 
-
+def read_ephindex(ephindex_path):
+    glitch_epochs = []
+    with open(ephindex_path) as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split()
+            if len(fields) < 2:
+                continue
+            try:
+                epoch = float(fields[1])
+                glitch_epochs.append(epoch)
+            except ValueError:
+                continue
+    return glitch_epochs
 
 def run_tempo2_exportres(par_path, tim_path, working_directory):
     command = [
@@ -154,30 +170,89 @@ def run_tempo2_exportres(par_path, tim_path, working_directory):
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(exc.stderr.strip() or exc.stdout.strip() or "tempo2 exportres failed") from exc
     out_res = os.path.join(working_directory, "out.res")
-    data = np.loadtxt(out_res, ndmin=2, usecols=(0, 1, 2))
-    print(data[:,1])
-    if data.shape[1] < 3:
-        raise ValueError("tempo2 out.res does not contain the expected phase columns")
+    times = []
+    phase = []
+    sigma = []
+    pulse_number = []
+    identifier = []
+    frequency_mhz = []
+
+    with open(out_res) as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split()
+            if len(fields) < 6:
+                continue
+            try:
+                times.append(float(fields[0]))
+                phase.append(float(fields[1]))
+                sigma.append(float(fields[2]))
+                pulse_number.append(np.int64(fields[3]))
+                identifier.append(fields[4])
+                frequency_mhz.append(float(fields[5]))
+            except ValueError:
+                continue
+
+    if not times:
+        raise ValueError("tempo2 out.res does not contain parsable residual rows with columns 0-5")
+
     return {
-        "times": data[:, 0],
-        "phase": data[:, 1],
-        "sigma": data[:, 2],
-        "raw": data,
+        "times": np.asarray(times, dtype=float),
+        "phase": np.asarray(phase, dtype=float),
+        "sigma": np.asarray(sigma, dtype=float),
+        "pulse_number": np.asarray(pulse_number, dtype=np.int64),
+        "identifier": np.asarray(identifier, dtype=object),
+        "frequency_mhz": np.asarray(frequency_mhz, dtype=float),
     }
 
 
-def identify_new_observations(all_times, trusted_times, tolerance):
-    trusted_times = np.sort(np.asarray(trusted_times, dtype=float))
+def identify_new_observations(all_times, all_identifiers, all_frequency_mhz, trusted_times, trusted_identifiers, trusted_frequency_mhz):
+    all_times = np.asarray(all_times, dtype=float)
+    all_identifiers = np.asarray(all_identifiers, dtype=object)
+    all_frequency_mhz = np.asarray(all_frequency_mhz, dtype=float)
+    trusted_times = np.asarray(trusted_times, dtype=float)
+    trusted_identifiers = np.asarray(trusted_identifiers, dtype=object)
+    trusted_frequency_mhz = np.asarray(trusted_frequency_mhz, dtype=float)
+
     mask = np.ones(len(all_times), dtype=bool)
-    for index, time_value in enumerate(all_times):
-        insertion_point = np.searchsorted(trusted_times, time_value)
-        nearby = []
-        if insertion_point < len(trusted_times):
-            nearby.append(abs(trusted_times[insertion_point] - time_value))
-        if insertion_point > 0:
-            nearby.append(abs(trusted_times[insertion_point - 1] - time_value))
-        if nearby and min(nearby) <= tolerance:
-            mask[index] = False
+
+    all_by_identifier = {}
+    trusted_by_identifier = {}
+    for index, identifier in enumerate(all_identifiers):
+        all_by_identifier.setdefault(identifier, []).append(index)
+    for index, identifier in enumerate(trusted_identifiers):
+        trusted_by_identifier.setdefault(identifier, []).append(index)
+
+    for identifier, all_indices in all_by_identifier.items():
+        trusted_indices = trusted_by_identifier.get(identifier, [])
+        if not trusted_indices:
+            continue
+
+        # Typical case: one-to-one identifier match.
+        if len(all_indices) == 1 and len(trusted_indices) == 1:
+            mask[all_indices[0]] = False
+            continue
+
+        # Rare duplicate-identifier case: greedily assign the closest time/frequency pairs.
+        pair_candidates = []
+        for all_index in all_indices:
+            for trusted_index in trusted_indices:
+                time_delta = abs(all_times[all_index] - trusted_times[trusted_index])
+                freq_delta = abs(all_frequency_mhz[all_index] - trusted_frequency_mhz[trusted_index])
+                pair_candidates.append((time_delta, freq_delta, all_index, trusted_index))
+        pair_candidates.sort(key=lambda row: (row[0], row[1]))
+
+        used_all = set()
+        used_trusted = set()
+        for _, _, all_index, trusted_index in pair_candidates:
+            if all_index in used_all or trusted_index in used_trusted:
+                continue
+            mask[all_index] = False
+            used_all.add(all_index)
+            used_trusted.add(trusted_index)
+
     return mask
 
 
@@ -491,8 +566,22 @@ def prune_particles(particles, particle_limit, particle_min_keep):
 
 
 
-def associate_phases(all_times, wrapped_phase, phase_sigma, trusted_mask, new_indices, covariance, wrap_options, args, constraints=None):
-    noise_variance = np.square(phase_sigma)
+def associate_phases(
+    all_times,
+    wrapped_phase,
+    phase_sigma,
+    trusted_mask,
+    new_indices,
+    covariance,
+    wrap_options,
+    args,
+    constraints=None,
+    identifiers=None,
+    frequency_mhz=None,
+):
+    efac = 1.0
+    equad = 0.0
+    noise_variance = np.square(phase_sigma*efac) + equad**2
     trusted_indices = np.flatnonzero(trusted_mask)
     trusted_values = wrapped_phase[trusted_mask]
     base_particle = Particle([], trusted_indices.tolist(), trusted_values.tolist(), 0.0, [])
@@ -534,6 +623,8 @@ def associate_phases(all_times, wrapped_phase, phase_sigma, trusted_mask, new_in
                 "time": float(all_times[step_result["observation_index"]]),
                 "wrapped_phase": float(step_result["observation"]),
                 "phase_sigma": float(phase_sigma[observation_index]),
+                "identifier": "" if identifiers is None else str(identifiers[observation_index]),
+                "frequency_mhz": float("nan") if frequency_mhz is None else float(frequency_mhz[observation_index]),
                 "map_wrap": map_wrap,
                 "map_wrap_probability": float(wrap_posteriors[map_wrap_index]),
                 "inlier_probability": aggregated_inlier,
@@ -563,6 +654,8 @@ def write_diagnostics(rows, output_path):
         "time",
         "wrapped_phase",
         "phase_sigma",
+        "identifier",
+        "frequency_mhz",
         "map_wrap",
         "map_wrap_probability",
         "inlier_probability",
@@ -584,16 +677,21 @@ def write_diagnostics(rows, output_path):
             writer.writerow(serializable)
 
 
-def extract_tim_mjd(line):
+def parse_tim_line(line):
+    """
+    Parse a TIM file line (standard format: identifier, frequency_MHz, time_MJD, error, site, flags...).
+    Returns (identifier, frequency_mhz, time_mjd) or (None, None, None) if parsing fails.
+    """
     tokens = line.split()
-    for token in tokens:
-        try:
-            value = float(token)
-        except ValueError:
-            continue
-        if 30000.0 <= value <= 100000.0:
-            return value
-    return None
+    if len(tokens) < 3:
+        return None, None, None
+    try:
+        identifier = tokens[0]
+        frequency_mhz = float(tokens[1])
+        time_mjd = float(tokens[2])
+        return identifier, frequency_mhz, time_mjd
+    except (ValueError, IndexError):
+        return None, None, None
 
 
 def upsert_pnadd(line, wrap):
@@ -617,36 +715,53 @@ def write_updated_tim(input_tim_path, output_tim_path, diagnostics, tolerance):
     decisions = [
         {
             "time": float(row["time"]),
+            "identifier": str(row.get("identifier", "")),
+            "frequency_mhz": float(row.get("frequency_mhz", float("nan"))),
             "wrap": int(row["map_wrap"]),
             "outlier": int(row["outlier_flag"]),
             "used": False,
         }
         for row in diagnostics
     ]
+    remaining_inliers = sum(1 for decision in decisions if not decision["outlier"])
 
     with open(input_tim_path) as input_handle, open(output_tim_path, "w") as output_handle:
         for raw_line in input_handle:
             line = raw_line.rstrip("\n")
             stripped = line.strip()
 
-            if not stripped or stripped.startswith("FORMAT"):
+            # Pass through comments and FORMAT lines as-is
+            if not stripped or stripped.startswith("#") or stripped.startswith("C") or stripped.startswith("FORMAT"):
                 output_handle.write(raw_line)
                 continue
 
-            toa_time = extract_tim_mjd(stripped)
-            if toa_time is None:
+            # Parse the line using standard TIM format
+            toa_identifier, toa_frequency, toa_time = parse_tim_line(stripped)
+            if toa_identifier is None or toa_time is None:
+                # Not enough fields or parsing failed; write as-is
                 output_handle.write(raw_line)
                 continue
 
+            if remaining_inliers == 0:
+                break
+
+            # Find best matching decision by identifier, then time/frequency
             best_index = None
-            best_delta = None
+            best_key = None
             for index, decision in enumerate(decisions):
                 if decision["used"]:
                     continue
-                delta = abs(decision["time"] - toa_time)
-                if delta <= tolerance and (best_delta is None or delta < best_delta):
+                if decision["identifier"] != toa_identifier:
+                    continue
+
+                time_delta = abs(decision["time"] - toa_time)
+                frequency_delta = float("inf")
+                if np.isfinite(decision["frequency_mhz"]) and toa_frequency is not None:
+                    frequency_delta = abs(decision["frequency_mhz"] - toa_frequency)
+                candidate_key = (time_delta, frequency_delta)
+                if best_key is None or candidate_key < best_key:
                     best_index = index
-                    best_delta = delta
+                    best_key = candidate_key
 
             if best_index is None:
                 output_handle.write(raw_line)
@@ -658,7 +773,12 @@ def write_updated_tim(input_tim_path, output_tim_path, diagnostics, tolerance):
             updated = upsert_pnadd(stripped, decision["wrap"])
             if decision["outlier"]:
                 updated = "C " + updated
-            output_handle.write(updated + "\n")
+            else:
+                remaining_inliers -= 1
+            output_handle.write(" " + updated + "\n")
+
+            if remaining_inliers == 0:
+                break
 
 
 def solve_with_constraints(all_times, wrapped_phase, phase_sigma, trusted_mask, new_indices, covariance, wrap_options, args, constraints=None):
@@ -686,7 +806,20 @@ def print_summary(best_particle, diagnostics):
     print("best_wrap_sequence", " ".join(str(value) for value in best_particle.assignments))
 
 
-def plot_diagnostics(times, wrapped_phase, diagnostics, trusted_mask, new_indices, output_path):
+def add_glitch_markers(axes, glitch_epochs):
+    if not glitch_epochs:
+        return
+
+    for axis in axes:
+        x_min, x_max = axis.get_xlim()
+        for epoch in glitch_epochs:
+            if x_min <= epoch <= x_max:
+                print("Adding glitch marker at epoch", epoch)
+                axis.axvline(epoch, color="purple", linestyle=":", linewidth=1.0, alpha=0.8, zorder=0)
+        axis.set_xlim(x_min, x_max)
+
+
+def plot_diagnostics(times, phase_sigma, wrapped_phase, diagnostics, trusted_mask, new_indices, output_path, glitch_epochs=None):
     """Generate diagnostic plot showing residuals, predictions, and outlier flags."""
     if not HAS_MATPLOTLIB:
         return None
@@ -695,6 +828,7 @@ def plot_diagnostics(times, wrapped_phase, diagnostics, trusted_mask, new_indice
     
     # Convert to arrays for indexing
     times = np.asarray(times)
+    phase_sigma = np.asarray(phase_sigma)
     wrapped_phase = np.asarray(wrapped_phase)
     trusted_mask = np.asarray(trusted_mask)
     
@@ -702,6 +836,7 @@ def plot_diagnostics(times, wrapped_phase, diagnostics, trusted_mask, new_indice
     diag_times = np.array([d["time"] for d in diagnostics])
     diag_map_wraps = np.array([d["map_wrap"] for d in diagnostics])
     diag_wrapped = np.array([d["wrapped_phase"] for d in diagnostics])
+    diag_phase_sigma = np.array([d["phase_sigma"] for d in diagnostics])
     diag_pred_means = np.array([d["predictive_mean"] for d in diagnostics])
     diag_pred_sigmas = np.array([d["predictive_sigma"] for d in diagnostics])
     diag_inliers = np.array([d["inlier_probability"] for d in diagnostics])
@@ -719,6 +854,9 @@ def plot_diagnostics(times, wrapped_phase, diagnostics, trusted_mask, new_indice
     if len(trusted_idx) > 0:
         ax1.scatter(times[trusted_idx], wrapped_phase[trusted_idx], 
                    alpha=0.6, s=30, c='gray', label='trusted (wrapped)', zorder=3)
+        ax1.errorbar(times[trusted_idx], wrapped_phase[trusted_idx], 
+                    yerr=phase_sigma[trusted_idx], fmt='none', 
+                    ecolor='gray', alpha=0.4, zorder=2, capsize=3, capthick=1)
     
     # Plot new observations (color by inlier probability)
     is_outlier = diag_outlier_flags > 0
@@ -728,13 +866,19 @@ def plot_diagnostics(times, wrapped_phase, diagnostics, trusted_mask, new_indice
         scatter1 = ax1.scatter(diag_times[is_inlier], diag_unwrapped[is_inlier],
                               c=diag_inliers[is_inlier], cmap='RdYlGn', vmin=0, vmax=1,
                               s=60, edgecolors='blue', linewidths=1.5, label='new (inlier)', zorder=5)
+        ax1.errorbar(diag_times[is_inlier], diag_unwrapped[is_inlier], 
+                    yerr=diag_phase_sigma[is_inlier], fmt='none', 
+                    ecolor='blue', alpha=0.4, zorder=4, capsize=3, capthick=1)
         cbar1 = plt.colorbar(scatter1, ax=ax1, pad=0.01)
         cbar1.set_label('inlier probability', fontsize=10)
     
     if np.any(is_outlier):
         ax1.scatter(diag_times[is_outlier], diag_unwrapped[is_outlier],
-                   marker='X', s=120, c='red', edgecolors='darkred', linewidths=2,
+                   marker='X', s=30, c='red', edgecolors='darkred', linewidths=2,
                    label='new (outlier)', zorder=6)
+        ax1.errorbar(diag_times[is_outlier], diag_unwrapped[is_outlier], 
+                    yerr=diag_phase_sigma[is_outlier], fmt='none', 
+                    ecolor='red', alpha=0.4, zorder=4, capsize=3, capthick=1)
     
     # Keep outlier predictions in the unwrapped frame so large excursions remain visible.
     pred_display = diag_pred_means
@@ -755,14 +899,19 @@ def plot_diagnostics(times, wrapped_phase, diagnostics, trusted_mask, new_indice
     scatter2 = ax2.scatter(diag_times[is_inlier], residuals[is_inlier],
                           c=diag_inliers[is_inlier], cmap='RdYlGn', vmin=0, vmax=1,
                           s=60, edgecolors='blue', linewidths=1.5, label='new (inlier)', zorder=5)
+    ax2.errorbar(diag_times[is_inlier], residuals[is_inlier], 
+                yerr=diag_phase_sigma[is_inlier], fmt='none', 
+                ecolor='blue', alpha=0.4, zorder=4, capsize=3, capthick=1)
     cbar2 = plt.colorbar(scatter2, ax=ax2, pad=0.01)
     cbar2.set_label('inlier probability', fontsize=10)
     
     if np.any(is_outlier):
         ax2.scatter(diag_times[is_outlier], residuals[is_outlier],
-                   marker='X', s=120, c='red', edgecolors='darkred', linewidths=2,
+                   marker='X', s=30, c='red', edgecolors='darkred', linewidths=2,
                    label='new (outlier)', zorder=6)
-    
+        ax2.errorbar(diag_times[is_outlier], residuals[is_outlier], 
+                    yerr=diag_phase_sigma[is_outlier], fmt='none', 
+                    ecolor='red', alpha=0.4, zorder=4, capsize=3, capthick=1)
     # Add uncertainty bands in residual space (±1σ centered at 0)
     ax2.fill_between(diag_times, -diag_pred_sigmas, diag_pred_sigmas, 
                     color='green', alpha=0.2, label='±1σ band', zorder=2)
@@ -773,6 +922,8 @@ def plot_diagnostics(times, wrapped_phase, diagnostics, trusted_mask, new_indice
     ax2.set_title('Residuals with Predictive Uncertainty', fontsize=12, fontweight='bold')
     ax2.legend(loc='best', fontsize=10)
     ax2.grid(True, alpha=0.3)
+
+    add_glitch_markers((ax1, ax2), glitch_epochs)
     
     plt.tight_layout()
     plot_path = output_path.replace('.csv', '.png')
@@ -826,6 +977,7 @@ class InteractivePhaseUI:
         output_tim_path,
         best_particle,
         diagnostics,
+        glitch_epochs=None,
     ):
         self.times = np.asarray(times)
         self.wrapped_phase = np.asarray(wrapped_phase)
@@ -840,6 +992,7 @@ class InteractivePhaseUI:
         self.output_tim_path = output_tim_path
         self.best_particle = best_particle
         self.diagnostics = diagnostics
+        self.glitch_epochs = list(glitch_epochs or [])
         self.constraints = {}
         self.selected_step = None
         self.hover_step = None
@@ -853,7 +1006,7 @@ class InteractivePhaseUI:
         self.fig.canvas.mpl_connect("key_press_event", self.on_key_press)
         self.fig.suptitle(
             "Interactive Phase Association\n"
-            "move mouse near point | i: force inlier | o: force outlier | =/-: adjust wrap | x: clear wrap | u: clear constraints | r: re-solve | s: save | q: quit",
+            "move mouse near point | i: force inlier | o: force outlier | =/-: adjust wrap | x: clear wrap | u: clear constraints | r: re-solve | w: write and quit | q: quit without saving",
             fontsize=12,
         )
         self.redraw()
@@ -962,8 +1115,9 @@ class InteractivePhaseUI:
             self.mark_dirty(f"Cleared all constraints for point {active_step}.")
         elif key == "r":
             self.solve_current()
-        elif key == "s":
+        elif key == "w":
             self.save_outputs()
+            plt.close(self.fig)
 
     def solve_current(self):
         try:
@@ -993,7 +1147,15 @@ class InteractivePhaseUI:
                 return
         write_diagnostics(self.diagnostics, self.output_path)
         write_updated_tim(self.newtim_path, self.output_tim_path, self.diagnostics, self.args.time_tolerance)
-        plot_diagnostics(self.times, self.wrapped_phase, self.diagnostics, self.trusted_mask, self.new_indices, self.output_path)
+        plot_diagnostics(
+            self.times,
+            self.wrapped_phase,
+            self.diagnostics,
+            self.trusted_mask,
+            self.new_indices,
+            self.output_path,
+            glitch_epochs=self.glitch_epochs,
+        )
         self.saved = True
         self.set_status(f"Saved outputs to {self.output_path} and {self.output_tim_path}")
         self.redraw()
@@ -1035,7 +1197,7 @@ class InteractivePhaseUI:
                 cmap="RdYlGn",
                 vmin=0,
                 vmax=1,
-                s=60,
+                s=30,
                 edgecolors="blue",
                 linewidths=1.5,
                 label="new (inlier)",
@@ -1049,7 +1211,7 @@ class InteractivePhaseUI:
                 diag_times[is_outlier],
                 diag_unwrapped[is_outlier],
                 marker="X",
-                s=120,
+                s=30,
                 c="red",
                 edgecolors="darkred",
                 linewidths=2,
@@ -1060,7 +1222,7 @@ class InteractivePhaseUI:
                 diag_times[is_outlier],
                 residuals[is_outlier],
                 marker="X",
-                s=120,
+                s=30,
                 c="red",
                 edgecolors="darkred",
                 linewidths=2,
@@ -1075,7 +1237,7 @@ class InteractivePhaseUI:
             cmap="RdYlGn",
             vmin=0,
             vmax=1,
-            s=50,
+            s=30,
             edgecolors="blue",
             linewidths=1.0,
             label="new points",
@@ -1140,6 +1302,8 @@ class InteractivePhaseUI:
         self.ax2.grid(True, alpha=0.3)
         self.ax2.legend(loc="best", fontsize=9)
 
+        add_glitch_markers((self.ax1, self.ax2), self.glitch_epochs)
+
         self.fig.canvas.draw_idle()
 
     def run(self):
@@ -1168,13 +1332,24 @@ def main():
     gp_parameters = read_gp_parameters(par_path)
     wrap_options = np.arange(args.wrap_min, args.wrap_max + 1, dtype=int)
 
+    glitch_index=[]
+    if args.ephindex is not None:
+        glitch_index = read_ephindex(args.ephindex)
+
     with tempfile.TemporaryDirectory(prefix="phase_assoc_") as working_directory:
 
         
         trusted = run_tempo2_exportres(par_path, tim_path, working_directory)
         combined = run_tempo2_exportres(par_path, newtim_path, working_directory)
 
-    new_mask = identify_new_observations(combined["times"], trusted["times"], args.time_tolerance)
+    new_mask = identify_new_observations(
+        combined["times"],
+        combined["identifier"],
+        combined["frequency_mhz"],
+        trusted["times"],
+        trusted["identifier"],
+        trusted["frequency_mhz"],
+    )
     if not np.any(new_mask):
         raise ValueError("No new observations were identified in the combined exportres output")
 
@@ -1182,6 +1357,8 @@ def main():
     times = combined["times"][order]
     wrapped_phase = combined["phase"][order]
     phase_sigma = combined["sigma"][order]
+    identifiers = combined["identifier"][order]
+    frequencies_mhz = combined["frequency_mhz"][order]
     trusted_mask = ~new_mask[order]
     new_indices = np.flatnonzero(new_mask[order])
 
@@ -1203,6 +1380,8 @@ def main():
         covariance,
         wrap_options,
         args,
+        identifiers=identifiers,
+        frequency_mhz=frequencies_mhz,
     )
 
     output_path = args.output
@@ -1243,6 +1422,7 @@ def main():
             output_tim_path,
             best_particle,
             diagnostics,
+            glitch_epochs=glitch_index,
         )
         saved, best_particle, diagnostics = ui.run()
         if not saved:
@@ -1251,7 +1431,16 @@ def main():
 
     write_diagnostics(diagnostics, output_path)
     write_updated_tim(newtim_path, output_tim_path, diagnostics, args.time_tolerance)
-    plot_path = plot_diagnostics(times, wrapped_phase, diagnostics, trusted_mask, new_indices, output_path)
+    plot_path = plot_diagnostics(
+        times,
+        phase_sigma,
+        wrapped_phase,
+        diagnostics,
+        trusted_mask,
+        new_indices,
+        output_path,
+        glitch_epochs=glitch_index,
+    )
     print_summary(best_particle, diagnostics)
     trusted_count = int(np.sum(trusted_mask))
     new_count = int(len(new_indices))

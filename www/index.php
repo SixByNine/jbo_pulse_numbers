@@ -3,15 +3,23 @@ require_once __DIR__ . '/lib/bootstrap.php';
 require_login();
 
 $runs = list_runs_with_rules($APP_CONFIG);
-$pending = [];
+$pending = list_pending_runs_for_review($APP_CONFIG);
 $blocked = [];
 $decided = [];
+$outdated = [];
+$hiddenTerminal = [];
 
 foreach ($runs as $run) {
+  if ((string) $run['status'] === 'outdated') {
+    $outdated[] = $run;
+    continue;
+  }
+  if (in_array((string) $run['status'], ['discarded', 'manual_cleared'], true)) {
+    $hiddenTerminal[] = $run;
+    continue;
+  }
     if ((string) $run['status'] === 'pending') {
-        if (run_is_eligible_for_review($run)) {
-            $pending[] = $run;
-        } else {
+        if (!run_is_eligible_for_review($run)) {
             $blocked[] = $run;
         }
     } else {
@@ -40,14 +48,15 @@ foreach ($runs as $run) {
     <div class="card"><h3>Pending</h3><p><?php echo count($pending); ?></p></div>
     <div class="card"><h3>Blocked by postpone date</h3><p><?php echo count($blocked); ?></p></div>
     <div class="card"><h3>Decided</h3><p><?php echo count($decided); ?></p></div>
+    <div class="card"><h3>Hidden terminal</h3><p><?php echo count($hiddenTerminal) + count($outdated); ?></p></div>
   </div>
 
   <div class="card">
-    <h2>Pending review</h2>
+    <h2>Ready for review</h2>
     <table>
       <tr><th>Pulsar</th><th>Run</th><th>Generated</th><th>Trusted</th><th>New</th><th>Action</th></tr>
-      <?php foreach ($pending as $run): ?>
-        <tr>
+      <?php foreach ($pending as $index => $run): ?>
+        <tr<?php echo $index >= 20 ? ' class="review-row-hidden"' : ''; ?>>
           <td><?php echo htmlspecialchars($run['pulsar']); ?></td>
           <td><?php echo htmlspecialchars($run['run_id']); ?></td>
           <td><?php echo htmlspecialchars((string) $run['run_generated_utc']); ?></td>
@@ -57,28 +66,18 @@ foreach ($runs as $run) {
         </tr>
       <?php endforeach; ?>
     </table>
+    <?php if (count($pending) > 20): ?>
+      <p><button type="button" id="show-more-review">More</button></p>
+    <?php endif; ?>
   </div>
 
-  <div class="card">
-    <h2>Pending but not yet eligible</h2>
-    <table>
-      <tr><th>Pulsar</th><th>Run</th><th>Generated</th><th>Postpone until</th></tr>
-      <?php foreach ($blocked as $run): ?>
-        <tr>
-          <td><?php echo htmlspecialchars($run['pulsar']); ?></td>
-          <td><?php echo htmlspecialchars($run['run_id']); ?></td>
-          <td><?php echo htmlspecialchars((string) $run['run_generated_utc']); ?></td>
-          <td><?php echo htmlspecialchars((string) $run['pulsar_postpone_until_utc']); ?></td>
-        </tr>
-      <?php endforeach; ?>
-    </table>
-  </div>
+ 
 
   <div class="card">
     <h2>Recently decided</h2>
     <table>
       <tr><th>Pulsar</th><th>Run</th><th>Status</th><th>Decision at</th><th>By</th><th>Action</th></tr>
-      <?php foreach (array_slice($decided, 0, 200) as $run): ?>
+      <?php foreach (array_slice($decided, 0, 50) as $run): ?>
         <tr>
           <td><?php echo htmlspecialchars($run['pulsar']); ?></td>
           <td><?php echo htmlspecialchars($run['run_id']); ?></td>
@@ -90,6 +89,37 @@ foreach ($runs as $run) {
       <?php endforeach; ?>
     </table>
   </div>
+
+   <div class="card">
+    <h2>Postponed Updates</h2>
+    <table>
+      <tr><th>Pulsar</th><th>Run</th><th>Generated</th><th>Postpone until</th><th>Action</th></tr>
+      <?php foreach ($blocked as $run): ?>
+        <tr>
+          <td><?php echo htmlspecialchars($run['pulsar']); ?></td>
+          <td><?php echo htmlspecialchars($run['run_id']); ?></td>
+          <td><?php echo htmlspecialchars((string) $run['run_generated_utc']); ?></td>
+          <td><?php echo htmlspecialchars((string) $run['pulsar_postpone_until_utc']); ?></td>
+          <td><a href="run.php?run_id=<?php echo urlencode($run['run_id']); ?>">View</a></td>
+        </tr>
+      <?php endforeach; ?>
+    </table>
+  </div>
 </main>
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  var button = document.getElementById('show-more-review');
+  if (!button) {
+    return;
+  }
+
+  button.addEventListener('click', function () {
+    document.querySelectorAll('.review-row-hidden').forEach(function (row) {
+      row.classList.remove('review-row-hidden');
+    });
+    button.hidden = true;
+  });
+});
+</script>
 </body>
 </html>

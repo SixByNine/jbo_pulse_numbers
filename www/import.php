@@ -29,7 +29,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   <?php if ($results !== null): ?>
     <div class="card">
       <h3>Import result</h3>
-      <p>Inserted: <?php echo (int) $results['inserted']; ?>, Skipped: <?php echo (int) $results['skipped']; ?>, Failed: <?php echo (int) $results['failed']; ?></p>
+      <p>Inserted: <?php echo (int) $results['inserted']; ?>, Skipped: <?php echo (int) $results['skipped']; ?>, Failed: <?php echo (int) $results['failed']; ?>, Marked outdated: <?php echo (int) $results['outdated']; ?></p>
       <table>
         <tr><th>Manifest</th><th>Status</th></tr>
         <?php foreach ($results['details'] as $row): ?>
@@ -41,7 +41,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
               if (!$result['ok']) {
                   echo 'failed: ' . htmlspecialchars($result['reason']);
               } elseif (!empty($result['inserted'])) {
+                  $outdated = isset($result['outdated']) ? (int) $result['outdated'] : 0;
                   echo 'inserted';
+                  if ($outdated > 0) {
+                    echo ' (marked outdated: ' . $outdated . ')';
+                  }
               } else {
                   echo 'skipped';
               }

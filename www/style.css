@@ -44,6 +44,10 @@ th, td {
   text-align: left;
 }
 
+.review-row-hidden {
+  display: none;
+}
+
 .badge {
   border-radius: 12px;
   padding: 2px 8px;
@@ -55,6 +59,10 @@ th, td {
 .badge.accepted { background: #207a31; }
 .badge.postponed { background: #9a6c00; }
 .badge.manual { background: #a52a2a; }
+.badge.manual_cleared { background: #6f5f3a; }
+.badge.discarded { background: #8d5f2b; }
+.badge.merged { background: #1b6f8a; }
+.badge.outdated { background: #5f6f7a; }
 
 .grid {
   display: grid;

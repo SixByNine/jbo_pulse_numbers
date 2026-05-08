@@ -25,6 +25,26 @@ function db_conn(array $config)
     return $pdo;
 }
 
+function db_column_exists(PDO $pdo, $table, $column)
+{
+    $stmt = $pdo->query('PRAGMA table_info(' . $table . ')');
+    $columns = $stmt->fetchAll();
+    foreach ($columns as $info) {
+        if (isset($info['name']) && (string) $info['name'] === (string) $column) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function db_ensure_column(PDO $pdo, $table, $column, $definition)
+{
+    if (db_column_exists($pdo, $table, $column)) {
+        return;
+    }
+    $pdo->exec('ALTER TABLE ' . $table . ' ADD COLUMN ' . $column . ' ' . $definition);
+}
+
 function init_db(array $config)
 {
     $pdo = db_conn($config);
@@ -47,7 +67,10 @@ function init_db(array $config)
             decision_at_utc TEXT,
             decision_by TEXT,
             postpone_until_utc TEXT,
-            decision_note TEXT
+            decision_note TEXT,
+            merged_at_utc TEXT,
+            merged_by TEXT,
+            merge_note TEXT
         )'
     );
 
@@ -64,4 +87,9 @@ function init_db(array $config)
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_runs_pulsar ON runs (pulsar)');
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_runs_status ON runs (status)');
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_runs_generated ON runs (run_generated_utc)');
+
+    // Migration path for databases created before merged-state columns existed.
+    db_ensure_column($pdo, 'runs', 'merged_at_utc', 'TEXT');
+    db_ensure_column($pdo, 'runs', 'merged_by', 'TEXT');
+    db_ensure_column($pdo, 'runs', 'merge_note', 'TEXT');
 }

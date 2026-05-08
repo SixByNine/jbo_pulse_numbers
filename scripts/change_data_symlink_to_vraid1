@@ -1,0 +1,10 @@
+#!/bin/bash
+
+
+old=$(readlink data_dir)
+psr=$(basename $old)
+new=/vraid1/timing/$psr
+echo "$old ==> $new"
+rm data_dir
+ln -s /vraid1/timing/$psr data_dir
+
