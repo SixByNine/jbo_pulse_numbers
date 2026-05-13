@@ -48,6 +48,15 @@ th, td {
   display: none;
 }
 
+.note-preview {
+  display: inline-block;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
 .badge {
   border-radius: 12px;
   padding: 2px 8px;
@@ -63,6 +72,7 @@ th, td {
 .badge.discarded { background: #8d5f2b; }
 .badge.merged { background: #1b6f8a; }
 .badge.outdated { background: #5f6f7a; }
+.badge.error { background: #a52a2a; }
 
 .grid {
   display: grid;

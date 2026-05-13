@@ -31,6 +31,9 @@ except ImportError:
 
 import run_enterprise.spectrum.cholspec as cholspec
 
+# Angular frequency for the annual sinusoid used in position / proper-motion terms (rad day^-1).
+_OMEGA_PER_DAY = 2.0 * np.pi / 365.25
+
 
 def ensure_interactive_matplotlib_backend():
     if not HAS_MATPLOTLIB:
@@ -110,6 +113,18 @@ def parse_args():
         help="polynomial order for GP parametric mean (0=constant, 1=linear, 2=quadratic; negative disables and uses zero-mean)",
     )
     parser.add_argument("--ephindex", default=None, help="optional JBO/AGL style ephindex.dat file giving dates of possible glitches")
+    parser.add_argument(
+        "--fit-pos", "--fit-position",
+        dest="fit_pos",
+        action="store_true",
+        help="include annual position sinusoid terms (A*sin(omega*t) + B*cos(omega*t)) in the GP parametric mean",
+    )
+    parser.add_argument(
+        "--fit-pm", "--fit-proper-motion",
+        dest="fit_pm",
+        action="store_true",
+        help="include proper-motion sinusoid terms (C*t*sin(omega*t) + D*t*cos(omega*t)) in the GP parametric mean; implies --fit-pos",
+    )
     return parser.parse_args()
 
 
@@ -138,7 +153,7 @@ def read_ephindex(ephindex_path):
             if not line or line.startswith("#"):
                 continue
             fields = line.split()
-            if len(fields) < 2:
+            if len(fields) < 3:
                 continue
             try:
                 epoch = float(fields[1])
@@ -155,13 +170,14 @@ def run_tempo2_exportres(par_path, tim_path, working_directory):
         "-f",
         par_path,
         tim_path,
-        "-writeres",
         "-nofit",
         "-npsr",
         "1",
         "-nobs",
         "50000",
     ]
+    print("Run tempo2:")
+    print(" ".join(command))
     try:
         subprocess.run(command, cwd=working_directory, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as exc:
@@ -173,7 +189,7 @@ def run_tempo2_exportres(par_path, tim_path, working_directory):
     pulse_number = []
     identifier = []
     frequency_mhz = []
-
+    print("Reading tempo2 out.res")
     with open(out_res) as handle:
         for raw_line in handle:
             line = raw_line.strip()
@@ -195,6 +211,7 @@ def run_tempo2_exportres(par_path, tim_path, working_directory):
     if not times:
         raise ValueError("tempo2 out.res does not contain parsable residual rows with columns 0-5")
 
+    print("Done reading tempo2 out.res")
     return {
         "times": np.asarray(times, dtype=float),
         "phase": np.asarray(phase, dtype=float),
@@ -294,7 +311,43 @@ def build_polynomial_design(times, order, reference_time, time_scale):
     return np.column_stack(columns)
 
 
-def predictive_observation_stats(candidate_index, observed_indices, observed_values, covariance, noise_variance, all_times, mean_poly_order):
+def build_mean_design(times, poly_order, reference_time, time_scale, fit_pos, fit_pm):
+    """Build a combined GLS design matrix.
+
+    Columns (in order, when enabled):
+      - Polynomial terms of degree 0..poly_order  (when poly_order >= 0)
+      - sin(omega*t), cos(omega*t)                (when fit_pos or fit_pm)
+      - t*sin(omega*t), t*cos(omega*t)            (when fit_pm)
+
+    t is measured in days from reference_time.
+    Returns an (N, K) array, or None when no columns would be produced.
+    """
+    times = np.asarray(times, dtype=float)
+    t_days = times - reference_time
+    columns = []
+
+    if poly_order >= 0:
+        centered = t_days / time_scale
+        columns.append(np.ones_like(centered))
+        for degree in range(1, poly_order + 1):
+            columns.append(centered ** degree)
+
+    if fit_pos or fit_pm:
+        phase = _OMEGA_PER_DAY * t_days
+        columns.append(np.sin(phase))
+        columns.append(np.cos(phase))
+
+    if fit_pm:
+        phase = _OMEGA_PER_DAY * t_days
+        columns.append(t_days * np.sin(phase))
+        columns.append(t_days * np.cos(phase))
+
+    if not columns:
+        return None
+    return np.column_stack(columns)
+
+
+def predictive_observation_stats(candidate_index, observed_indices, observed_values, covariance, noise_variance, all_times, mean_poly_order, fit_pos=False, fit_pm=False):
     prior_mean = 0.0
     prior_variance = covariance[candidate_index, candidate_index] + noise_variance[candidate_index]
     if not observed_indices:
@@ -305,25 +358,25 @@ def predictive_observation_stats(candidate_index, observed_indices, observed_val
     system_covariance = covariance[np.ix_(history, history)] + np.diag(noise_variance[history])
     cross_covariance = covariance[candidate_index, history]
 
-    if mean_poly_order < 0:
+    if mean_poly_order < 0 and not fit_pos and not fit_pm:
         solved_mean = np.linalg.solve(system_covariance, observed)
         solved_cross = np.linalg.solve(system_covariance, cross_covariance)
         predictive_mean = float(cross_covariance.dot(solved_mean))
         predictive_variance = float(prior_variance - cross_covariance.dot(solved_cross))
         return predictive_mean, max(predictive_variance, 1e-12)
 
-    reference_time = float(np.min(all_times))
+    reference_time = float(np.median(all_times))
     time_span = float(np.max(all_times) - np.min(all_times))
     time_scale = max(time_span, 1.0)
 
     history_times = np.asarray(all_times, dtype=float)[history]
     candidate_time = np.asarray([all_times[candidate_index]], dtype=float)
-    design_history = build_polynomial_design(history_times, mean_poly_order, reference_time, time_scale)
-    design_candidate = build_polynomial_design(candidate_time, mean_poly_order, reference_time, time_scale)[0]
+    design_history = build_mean_design(history_times, mean_poly_order, reference_time, time_scale, fit_pos, fit_pm)
+    design_candidate = build_mean_design(candidate_time, mean_poly_order, reference_time, time_scale, fit_pos, fit_pm)[0]
 
     solved_cross = np.linalg.solve(system_covariance, cross_covariance)
 
-    # GLS estimate of the polynomial mean coefficients.
+    # GLS estimate of the mean model coefficients.
     whitened_design = np.linalg.solve(system_covariance, design_history)
     fisher = design_history.T.dot(whitened_design)
     fisher_inv = np.linalg.pinv(fisher)
@@ -446,9 +499,13 @@ def process_single_observation(
             noise_variance,
             all_times,
             args.mean_poly_order,
+            fit_pos=args.fit_pos,
+            fit_pm=args.fit_pm,
         )
-        cumulative_wrap = np.sum(particle.assignments) if particle.assignments else 0
-        baseline_wrap_value = cumulative_wrap
+        baseline_wrap_value = round(predictive_mean - observation)
+
+        
+
         candidate_rows, inlier_probability, marginal_log_likelihood = evaluate_wrap_candidates(
             observation,
             predictive_mean,
@@ -554,7 +611,7 @@ def prune_particles(particles, particle_limit, particle_min_keep):
     ordered = sorted(particles, key=lambda particle: score(particle), reverse=True)
 
     max_score= score(ordered[0]) if ordered else -np.inf
-    delta = 100.0 
+    delta = 1000.0 
     trimmed = [p for p in ordered if score(p) >= max_score - delta]
     if len(ordered) < particle_min_keep:
         trimmed = ordered[:particle_min_keep]
@@ -606,7 +663,20 @@ def associate_phases(
             args,
             constraints=constraints,
         )
-
+        verbose=False
+        if verbose:
+            print("Step {}/{}: Proposed particles before pruning:".format(step_number + 1, len(new_indices)))
+            for particle in sorted(step_result["proposal_particles"], key=lambda p: p.log_weight, reverse=True):
+                # print In/Outlier and wrap assignments for each proposed particle
+                io_flags = []
+                for diagnostic in particle.diagnostics:
+                    if "branch_is_outlier" in diagnostic:
+                        io_flags.append("O" if diagnostic["branch_is_outlier"] else "I")
+                    else:
+                        io_flags.append("?")
+                wraps = ",".join(str(wrap) for wrap in particle.assignments)
+                io_str = "".join(io_flags)
+                print(f"  Particle(log_weight={particle.log_weight:.6f}, wraps=[{wraps}], in_out={io_str})")
         particles = prune_particles(step_result["proposal_particles"], args.particle_limit, args.particle_min_keep)
         normalized_weights, _ = normalize_log_weights([particle.log_weight for particle in particles])
         ess = 1.0 / np.sum(normalized_weights ** 2)
@@ -780,12 +850,13 @@ def write_updated_tim(input_tim_path, output_tim_path, diagnostics):
             decision["used"] = True
 
             total_wrap = decision["baseline_wrap"] + decision["map_wrap"]
-            updated = update_pulse_number(stripped, total_wrap)
+            #print(f"Updating line for time={decision['time']:.8f} identifier={decision['identifier']} frequency={decision['frequency_mhz']} with total_wrap={total_wrap} (baseline={decision['baseline_wrap']} map={decision['map_wrap']} outlier={decision['outlier']})")
+            updated = " " + update_pulse_number(stripped, total_wrap)
             if decision["outlier"]:
                 updated = "C " + updated
             else:
                 remaining_inliers -= 1
-            output_handle.write(" " + updated + "\n")
+            output_handle.write(updated + "\n")
 
             if remaining_inliers == 0:
                 break
@@ -806,10 +877,11 @@ def solve_with_constraints(all_times, wrapped_phase, phase_sigma, trusted_mask, 
 
 
 def print_summary(best_particle, diagnostics):
-    print("index time map_wrap wrap_probability inlier_probability predictive_mean predictive_sigma outlier")
+    print("index time map_wrap baseline_wrap wrap_probability inlier_probability predictive_mean predictive_sigma outlier")
     for index, row in enumerate(diagnostics, start=1):
         print(
             f"{index:5d} {row['time']:15.8f} {row['map_wrap']:8d} "
+            f"{row['baseline_wrap']:16.0f} "
             f"{row['map_wrap_probability']:16.6f} {row['inlier_probability']:18.6f} "
             f"{row['predictive_mean']:16.6f} {row['predictive_sigma']:16.6f} {row['outlier_flag']:7d}"
         )
@@ -903,8 +975,18 @@ def plot_diagnostics(times, phase_sigma, wrapped_phase, diagnostics, trusted_mas
     ax1.set_ylabel('phase (unwrapped)', fontsize=11)
     ax1.set_title('Wrapped Phase Observations with Predictions', fontsize=12, fontweight='bold')
     ax1.legend(loc='best', fontsize=10)
-    ax1.grid(True, alpha=0.3)
-    
+
+    # Add faint horizontal lines at every integer y-value in view.
+    y_min_1, y_max_1 = ax1.get_ylim()
+    if y_max_1 - y_min_1 < 1000: 
+        for y in range(int(np.floor (y_min_1)), int(np.ceil(y_max_1)) + 1):
+            ax1.axhline(y=y, color='k', linewidth=0.5, alpha=0.12, zorder=1)
+    else:
+        # add text warning to plot if y-range is too large to show gridlines - solution likely wrong
+        ax1.text(0.5, 0.9, 'WARNING: Large y-range may indicate incorrect solution',
+                 transform=ax1.transAxes, color='red', fontsize=10, ha='center')
+    ax1.set_ylim(y_min_1, y_max_1)
+
     # ========== Panel 2: Residuals ==========
     # Plot residuals for new observations
     scatter2 = ax2.scatter(diag_times[is_inlier], residuals[is_inlier],
@@ -932,7 +1014,13 @@ def plot_diagnostics(times, phase_sigma, wrapped_phase, diagnostics, trusted_mas
     ax2.set_ylabel('residual (unwrapped obs - predicted mean)', fontsize=11)
     ax2.set_title('Residuals with Predictive Uncertainty', fontsize=12, fontweight='bold')
     ax2.legend(loc='best', fontsize=10)
-    ax2.grid(True, alpha=0.3)
+
+    y_min_2, y_max_2 = ax2.get_ylim()
+    if y_max_2 - y_min_2 < 1000:
+        for y in range(int(np.floor (y_min_2)), int(np.ceil(y_max_2)) + 1):
+            ax2.axhline(y=y, color='k', linewidth=0.5, alpha=0.12, zorder=1)
+    
+    ax2.set_ylim(y_min_2, y_max_2)
 
     add_glitch_markers((ax1, ax2), glitch_epochs)
     
@@ -1009,7 +1097,7 @@ class InteractivePhaseUI:
         self.hover_step = None
         self.dirty = False
         self.last_error = None
-        self.saved = False
+        self.save_on_exit = False
 
         self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(14, 10))
         self.status_text = self.fig.text(0.01, 0.01, "", fontsize=9)
@@ -1128,7 +1216,7 @@ class InteractivePhaseUI:
         elif key == "r":
             self.solve_current()
         elif key == "w":
-            self.save_outputs()
+            self.save_on_exit=True
             plt.close(self.fig)
 
     def solve_current(self):
@@ -1152,25 +1240,7 @@ class InteractivePhaseUI:
             self.set_status(f"Solve failed: {exc}")
         self.redraw()
 
-    def save_outputs(self):
-        if self.dirty:
-            self.solve_current()
-            if self.last_error is not None:
-                return
-        write_diagnostics(self.diagnostics, self.output_path)
-        write_updated_tim(self.newtim_path, self.output_tim_path, self.diagnostics)
-        plot_diagnostics(
-            self.times,
-            self.wrapped_phase,
-            self.diagnostics,
-            self.trusted_mask,
-            self.new_indices,
-            self.output_path,
-            glitch_epochs=self.glitch_epochs,
-        )
-        self.saved = True
-        self.set_status(f"Saved outputs to {self.output_path} and {self.output_tim_path}")
-        self.redraw()
+  
 
     def redraw(self):
         self.ax1.clear()
@@ -1321,7 +1391,7 @@ class InteractivePhaseUI:
 
     def run(self):
         plt.show()
-        return self.saved, self.best_particle, self.diagnostics
+        return self.save_on_exit, self.best_particle, self.diagnostics
 
 
 
@@ -1333,6 +1403,9 @@ def main():
     tim_path = os.path.abspath(args.tim)
     newtim_path = os.path.abspath(args.newtim)
     
+    if args.fit_pm:
+        args.fit_pos = True
+
     if not os.path.exists(par_path):
         raise FileNotFoundError(f"Par file not found: {par_path}")
     if not os.path.exists(tim_path):
@@ -1350,9 +1423,8 @@ def main():
         glitch_index = read_ephindex(args.ephindex)
 
     with tempfile.TemporaryDirectory(prefix="phase_assoc_") as working_directory:
-
-        
         trusted = run_tempo2_exportres(par_path, tim_path, working_directory)
+    with tempfile.TemporaryDirectory(prefix="phase_assoc_") as working_directory:
         combined = run_tempo2_exportres(par_path, newtim_path, working_directory)
 
     new_mask = identify_new_observations(
@@ -1437,8 +1509,8 @@ def main():
             diagnostics,
             glitch_epochs=glitch_index,
         )
-        saved, best_particle, diagnostics = ui.run()
-        if not saved:
+        save_on_exit, best_particle, diagnostics = ui.run()
+        if not save_on_exit:
             print("interactive_session_closed_without_saving")
             return
 
@@ -1484,6 +1556,8 @@ def main():
             "outlier_prob": args.outlier_prob,
             "outlier_sigma": args.outlier_sigma,
             "mean_poly_order": args.mean_poly_order,
+            "fit_pos": bool(args.fit_pos),
+            "fit_pm": bool(args.fit_pm),
             "interactive": bool(args.interactive),
         },
         "summary": {

@@ -35,6 +35,10 @@ $manualRuns = array_values(array_filter($runs, function ($run) {
     return isset($run['status']) && (string) $run['status'] === 'manual';
 }));
 
+$errorRuns = array_values(array_filter($runs, function ($run) {
+    return isset($run['status']) && (string) $run['status'] === 'error';
+}));
+
 if ($manualOnly) {
     $runs = $manualRuns;
 }
@@ -76,6 +80,7 @@ $payload = [
     'merged_runs' => $merged,
     'manual_runs' => $manualRuns,
     'manual_pulsars' => array_values($manualPulsars),
+    'error_runs' => $errorRuns,
     'pulsar_rules' => $pulsarRules,
 ];
 

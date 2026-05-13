@@ -19,15 +19,34 @@ if (!$run) {
 $error = null;
 $postponeInputValue = '';
 $canDecide = ((string) $run['status']) === 'pending';
+$canEditManualNote = ((string) $run['status']) === 'manual';
+$decisionNote = trim((string) ($run['decision_note'] ?? ''));
+$manualNoteInputValue = $decisionNote;
+$relatedActiveRuns = [];
+if (!$canDecide) {
+  $relatedActiveRuns = list_runs_for_pulsar_with_statuses(
+    $APP_CONFIG,
+    (string) $run['pulsar'],
+    ['pending', 'accepted', 'postponed', 'manual'],
+    $runId
+  );
+}
 $nextPendingRunId = find_next_pending_run_id($APP_CONFIG, $runId);
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-  if (!$canDecide) {
-    $error = 'This run is already terminal and cannot be changed.';
-  }
     $action = isset($_POST['action']) ? (string) $_POST['action'] : '';
     $postponeRaw = isset($_POST['postpone_until']) ? trim((string) $_POST['postpone_until']) : '';
+  $manualNoteInputValue = isset($_POST['note']) ? trim((string) $_POST['note']) : $manualNoteInputValue;
   $postponeInputValue = $postponeRaw;
     $postponeUtc = null;
+
+  if ($action === 'update_manual_note') {
+    if (!$canEditManualNote) {
+      $error = 'Only manual runs can have their note edited.';
+    }
+  } elseif (!$canDecide) {
+    $error = 'This run is already terminal and cannot be changed.';
+  }
+
   if ($error === null && $action === 'postpone') {
         if ($postponeRaw === '') {
             $error = 'Postpone date is required.';
@@ -38,10 +57,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if ($error === null) {
         try {
-          if ($action !== 'skip') {
+          if ($action === 'update_manual_note') {
+            update_manual_decision_note($APP_CONFIG, $runId, $_POST['note'] ?? '');
+            header('Location: run.php?run_id=' . urlencode($runId));
+          } elseif ($action !== 'skip') {
             decide_run($APP_CONFIG, $runId, $action, (string) current_user(), $postponeUtc, $_POST['note'] ?? '');
-          }
-          if (is_string($nextPendingRunId) && $nextPendingRunId !== '') {
+            if (is_string($nextPendingRunId) && $nextPendingRunId !== '') {
+            header('Location: run.php?run_id=' . urlencode($nextPendingRunId));
+            } else {
+            header('Location: index.php');
+            }
+          } elseif (is_string($nextPendingRunId) && $nextPendingRunId !== '') {
             header('Location: run.php?run_id=' . urlencode($nextPendingRunId));
           } else {
             header('Location: index.php');
@@ -88,6 +114,11 @@ if ($postponeInputValue === '') {
     <?php if ($error): ?>
       <p style="color:#a52a2a"><?php echo htmlspecialchars($error); ?></p>
     <?php endif; ?>
+    <?php if ((string) $run['status'] === 'error'): ?>
+      <p style="color:#a52a2a"><strong>Processing error:</strong> <?php echo htmlspecialchars($decisionNote); ?></p>
+    <?php elseif ($decisionNote !== ''): ?>
+      <p><strong>Decision note:</strong> <?php echo htmlspecialchars($decisionNote); ?></p>
+    <?php endif; ?>
     <?php if ($canDecide): ?>
       <form method="post">
         <div class="actions">
@@ -106,11 +137,36 @@ if ($postponeInputValue === '') {
         <br>
         <label>Notes<br><textarea name="note" rows="3" cols="80"></textarea></label>
       </form>
+    <?php elseif ($canEditManualNote): ?>
+      <p>This run is flagged for manual intervention. You can update the note here while the run remains blocked for automated processing.</p>
+      <form method="post">
+        <input type="hidden" name="action" value="update_manual_note">
+        <label>Manual follow-up note<br><textarea name="note" rows="5" cols="80" maxlength="5000"><?php echo htmlspecialchars($manualNoteInputValue); ?></textarea></label>
+        <div class="actions">
+          <button type="submit">Update note</button>
+        </div>
+      </form>
     <?php else: ?>
       <?php if ((string) $run['status'] === 'outdated'): ?>
         <p>This run was automatically marked outdated because a newer run for this pulsar was imported. It is read-only.</p>
       <?php else: ?>
         <p>This run is in a terminal state and cannot be changed from the review UI.</p>
+      <?php endif; ?>
+    <?php endif; ?>
+    <?php if (!$canDecide): ?>
+      <h3>Other active runs for this pulsar</h3>
+      <?php if (!empty($relatedActiveRuns)): ?>
+        <ul>
+          <?php foreach ($relatedActiveRuns as $relatedRun): ?>
+            <li>
+              <a href="run.php?run_id=<?php echo urlencode((string) $relatedRun['run_id']); ?>"><?php echo htmlspecialchars((string) $relatedRun['run_id']); ?></a>
+              <span class="badge <?php echo htmlspecialchars((string) $relatedRun['status']); ?>"><?php echo htmlspecialchars((string) $relatedRun['status']); ?></span>
+              Generated: <?php echo htmlspecialchars((string) $relatedRun['run_generated_utc']); ?>
+            </li>
+          <?php endforeach; ?>
+        </ul>
+      <?php else: ?>
+        <p>No other active runs for this pulsar.</p>
       <?php endif; ?>
     <?php endif; ?>
   </div>
@@ -122,6 +178,7 @@ if ($postponeInputValue === '') {
     </div>
   <?php endif; ?>
 
+  <?php if ((string) $run['status'] !== 'error'): ?>
   <div class="card">
     <h3>Artifacts</h3>
     <ul>
@@ -130,6 +187,7 @@ if ($postponeInputValue === '') {
       <li><a href="serve_artifact.php?run_id=<?php echo urlencode($run['run_id']); ?>&type=manifest">Manifest JSON</a></li>
     </ul>
   </div>
+  <?php endif; ?>
 
  
 </main>

@@ -4,7 +4,7 @@
 
 
 usage() {
-    echo "Usage: $0 [-i|--interactive] [-n|--no-upload] [-f|--force] [pulsar_directory_or_name]"
+    echo "Usage: $0 [-3|--cubic] [-2|--no-cubic] [--no-pm] [-i|--interactive] [-n|--no-upload] [-f|--force] [--clear-manual] [pulsar_directory_or_name]"
 }
 pulsar_base_dir="${TIMING_PULSAR_BASE_DIR:-$(pwd)}"
 
@@ -13,9 +13,23 @@ upload_flag="1"
 force_flag="0"
 clear_manual_flag="0"
 psrdir=""
+mean_poly_order=3
+fit_pm_flag="--fit-pm"
 
 while [[ $# -gt 0 ]] ; do
     case "$1" in
+        -3|--cubic)
+            mean_poly_order=3
+            shift
+            ;;
+        -2|--no-cubic)
+            mean_poly_order=2
+            shift
+            ;;
+        --no-pm)
+            fit_pm_flag=""
+            shift
+            ;;
         -i|--interactive)
             interactive_flag="1"
             shift
@@ -80,6 +94,20 @@ cd $psrdir
 psrdir=$(pwd)
 pulsar_name=$(basename "$psrdir")
 
+report_processing_error() {
+    local error_message="$1"
+
+    if [[ "$upload_flag" == "1" ]]; then
+        local error_run_id
+        error_run_id="${pulsar_name}_error_$(date -u +'%Y%m%d_%H%M%S')"
+        if ! python3 "$scriptdir/log_error_run.py" "$pulsar_name" "$error_run_id" "$error_message"; then
+            echo "Warning: failed to report processing error via API for $pulsar_name" >&2
+        fi
+    else
+        echo "Upload disabled; skipping error API reporting (dry run mode)." >&2
+    fi
+}
+
 if [[ "$clear_manual_flag" == "1" ]]; then
     echo "Clearing manual follow-up status for $pulsar_name"
     "$scriptdir/manual_followup.py" --clear "$pulsar_name"
@@ -114,6 +142,10 @@ cd dfb_data || exit 1
 
 for f in ../data_dir/dfb/J??????_??????.FT ; do
     l=$(basename $f)
+    if [[ -e bad.list ]] && grep -q "^$l$" bad.list ; then
+        echo "Skipping bad file $f"
+        continue
+    fi
     if [[ "$l" < "J2407" ]] ; then
         if [[ ! -e $l ]] ; then
             ln -s $f .
@@ -134,6 +166,32 @@ for f in ../data_dir/roach/2???*.ft ; do
 done
 
 cd $psrdir || exit 1
+
+echo "Checking for broken symlinks in dfb_data"
+broken_symlinks=$(find dfb_data -type l ! -exec test -e {} \; -print)
+if [[ -n "$broken_symlinks" ]]; then
+    echo "Found broken symlinks in dfb_data:" >&2
+    printf '%s\n' "$broken_symlinks" >&2
+    report_processing_error "Broken symlink(s) detected in dfb_data; manual intervention required."
+    exit 1
+fi
+
+
+echo "Checking for harmonic issues"
+# Check for issues where a wrong ephemeris has been installed using the check_harmonic script
+"$scriptdir/check_harmonic.py" dfb_data/*.FT
+check_ok=$?
+if [[ $check_ok -ne 0 ]]; then
+    echo "Harmonic check failed. Please investigate the output above and fix any issues before proceeding." >&2
+
+    report_processing_error "Harmonic check failed before extrapolation; manual intervention required."
+
+    exit 1
+fi
+
+
+# Check for an issue in best.tim where commented ToAs have accidently had a space prepended.
+sed -i -e "s:^ C :C :" best.tim
 
 last_dfb=$(grep -v "^C" best.tim | grep -e "J......_......" | sed -e "s:FTp:FT:" |  tail -n 1 | awk '{print $1}')
 last_roach=$(grep -v "^C" best.tim | grep -e "ROACH_" | sed -e "s:FTp:FT:" |  tail -n 1 | awk '{print $1}')
@@ -183,8 +241,8 @@ if [[ -n "$newfiles_DFB" ]] ; then
         fname=$(basename $1)
         fname=${fname%.*}
         if grep -q $fname best.tim ; then
-            pn=$(grep $fname best.tim | sed -e 's:.*\(-pn [0-9]*\)[^0-9].*:\1:' | grep pn)
-            half=$(grep $fname best.tim | sed -e 's:.*\(-halfperiod [A-Z]*\)[^A-Z].*:\1:' | grep halfperiod)
+            pn=$(grep $fname best.tim | sed -e 's:.*\(-pn .[0-9]*\).*:\1:' | grep pn)
+            half=$(grep $fname best.tim | sed -e 's:.*\(-halfperiod [A-Z0-9]*\).*:\1:' | grep halfperiod)
         else
             continue
         fi
@@ -205,6 +263,8 @@ if [[ -n "$newfiles_DFB" ]] ; then
         # if the absolute value of delta_pn is larger than 100 we might want to flag this to not be trusted
         if [[ $(echo "$delta_pn" | awk '{print ($1 < -100 || $1 > 100)}') -eq 1 ]]; then
             wflag="-distrust delta_pn_large"
+            echo "Warning: large pulse number change for $fname: $delta_pn. Marking as untrusted." >&2
+            echo "$pn $F0 $toa1 $line2" >&2
         fi
         pn_new=$(echo "$pn $delta_pn" | awk '
         function nint(x) { return (x >= 0) ? int(x + 0.5) : int(x - 0.5) }
@@ -266,11 +326,11 @@ if [[ -n "$newfiles_DFB" ]] || [[ -n "$newfiles_ROACH" ]] ; then
     grep -v -F -- "-distrust" $trusted_file > updates/trusted.tim
 
     cd updates
-    
 
-    if [[ -e ../enterprise_log3_sub3/J1941+2525_run.par.post ]] ; then
-        cp ../enterprise_log3_sub3/J1941+2525_run.par.post update.par
-        tempo2 -f update.par trusted.tim -newpar
+    default_enterprise_run=../enterprise_log3_sub3/
+    if [[ -e "${default_enterprise_run}/${pulsar_name}_run.par.post" && -e "${default_enterprise_run}/${pulsar_name}.tim" ]] ; then
+        echo "Making 'final.par' par file from $default_enterprise_run for pulse number extrapolation"
+        tempo2 -f "${default_enterprise_run}/${pulsar_name}_run.par.post" "${default_enterprise_run}/${pulsar_name}.tim" -newpar 
         mv new.par update.par
     elif [[ -e ../analysis/final.par ]] ; then
         cp ../analysis/final.par update.par
@@ -335,7 +395,8 @@ if [[ -n "$newfiles_DFB" ]] || [[ -n "$newfiles_ROACH" ]] ; then
         --outlier-prob 0.02
         --particle-limit 128
         --covariance-scale 32
-        --mean-poly-order 2
+        --mean-poly-order $mean_poly_order
+        $fit_pm_flag
         --run-id "$run_id"
         --pulsar "$pulsar_name"
         --output-dir "$stage_dir"

@@ -44,9 +44,34 @@ function resolve_manifest_output_path($manifestPath, $value)
     return $manifestDir . '/' . ltrim($candidate, '/');
 }
 
-function mark_older_pending_runs_outdated(PDO $pdo, $pulsar, $runId, $newRunSortUtc)
+function mark_older_runs_outdated(PDO $pdo, $pulsar, $runId, $newRunSortUtc, array $statuses = ['pending'], $decisionBy = 'system_import', $notePrefix = 'Outdated by newer imported run ')
 {
-    $note = 'Outdated by newer imported run ' . (string) $runId;
+    $normalizedStatuses = [];
+    foreach ($statuses as $status) {
+        $value = trim((string) $status);
+        if ($value !== '') {
+            $normalizedStatuses[] = $value;
+        }
+    }
+    if (empty($normalizedStatuses)) {
+        return 0;
+    }
+
+    $statusPlaceholders = [];
+    $params = [
+        ':decision_at_utc' => db_now_utc(),
+        ':decision_by' => $decisionBy,
+        ':decision_note' => $notePrefix . (string) $runId,
+        ':pulsar' => $pulsar,
+        ':run_id' => $runId,
+        ':new_sort_utc' => $newRunSortUtc,
+    ];
+    foreach ($normalizedStatuses as $index => $status) {
+        $placeholder = ':status_' . $index;
+        $statusPlaceholders[] = $placeholder;
+        $params[$placeholder] = $status;
+    }
+
     $stmt = $pdo->prepare(
         'UPDATE runs
          SET status = "outdated",
@@ -59,17 +84,10 @@ function mark_older_pending_runs_outdated(PDO $pdo, $pulsar, $runId, $newRunSort
              merge_note = NULL
          WHERE pulsar = :pulsar
            AND run_id <> :run_id
-           AND status = "pending"
+           AND status IN (' . implode(', ', $statusPlaceholders) . ')
            AND COALESCE(run_generated_utc, imported_at_utc, "") < :new_sort_utc'
     );
-    $stmt->execute([
-        ':decision_at_utc' => db_now_utc(),
-        ':decision_by' => 'system_import',
-        ':decision_note' => $note,
-        ':pulsar' => $pulsar,
-        ':run_id' => $runId,
-        ':new_sort_utc' => $newRunSortUtc,
-    ]);
+    $stmt->execute($params);
 
     return $stmt->rowCount();
 }
@@ -205,7 +223,7 @@ function import_manifest(array $config, $manifestPath)
 
         $inserted = $stmt->rowCount() > 0;
         if ($inserted) {
-            $outdatedCount = mark_older_pending_runs_outdated($pdo, $pulsar, $runId, $newRunSortUtc);
+            $outdatedCount = mark_older_runs_outdated($pdo, $pulsar, $runId, $newRunSortUtc, ['pending']);
             $manualRun = find_active_manual_run_for_pulsar($pdo, $pulsar);
             if ($manualRun && (string) $manualRun['run_id'] !== $runId) {
                 $blockedByManual = discard_run_due_to_manual_block($pdo, ['run_id' => $runId], $manualRun);
@@ -487,12 +505,149 @@ function clear_manual_run(array $config, $actor, $runId = null, $pulsar = null, 
     return find_run($config, $run['run_id']);
 }
 
+function update_manual_decision_note(array $config, $runId, $note)
+{
+    $pdo = db_conn($config);
+    $stmt = $pdo->prepare('SELECT * FROM runs WHERE run_id = :run_id');
+    $stmt->execute([':run_id' => $runId]);
+    $run = $stmt->fetch();
+    if (!$run) {
+        throw new RuntimeException('Run not found.');
+    }
+
+    if ((string) $run['status'] !== 'manual') {
+        throw new RuntimeException('Only manual runs can have their note edited.');
+    }
+
+    $noteValue = trim((string) $note);
+    if (strlen($noteValue) > 5000) {
+        throw new RuntimeException('Decision note must be 5000 characters or fewer.');
+    }
+    if ($noteValue === '') {
+        $noteValue = null;
+    }
+
+    $update = $pdo->prepare(
+        'UPDATE runs
+         SET decision_note = :decision_note
+         WHERE run_id = :run_id
+           AND status = "manual"'
+    );
+    $update->execute([
+        ':decision_note' => $noteValue,
+        ':run_id' => $runId,
+    ]);
+    if ($update->rowCount() < 1 && ((string) ($run['decision_note'] ?? '')) !== (string) ($noteValue ?? '')) {
+        throw new RuntimeException('Failed to update manual run note.');
+    }
+
+    return find_run($config, $runId);
+}
+
+function log_error_run(array $config, $pulsar, $runId, $message)
+{
+    $pdo = db_conn($config);
+    $now = db_now_utc();
+
+    $pdo->beginTransaction();
+    try {
+        $update = $pdo->prepare(
+            'UPDATE runs
+             SET status = "error",
+                 decision_at_utc = :decision_at_utc,
+                 decision_by = "system_error",
+                 postpone_until_utc = NULL,
+                 decision_note = :decision_note,
+                 merged_at_utc = NULL,
+                 merged_by = NULL,
+                 merge_note = NULL
+             WHERE run_id = :run_id'
+        );
+        $update->execute([
+            ':decision_at_utc' => $now,
+            ':decision_note' => $message,
+            ':run_id' => $runId,
+        ]);
+
+        if ($update->rowCount() === 0) {
+            $insert = $pdo->prepare(
+                'INSERT INTO runs (
+                    run_id, pulsar, run_generated_utc, imported_at_utc, manifest_path,
+                    status, decision_at_utc, decision_by, decision_note
+                ) VALUES (
+                    :run_id, :pulsar, NULL, :imported_at_utc, "",
+                    "error", :decision_at_utc, "system_error", :decision_note
+                )'
+            );
+            $insert->execute([
+                ':run_id' => $runId,
+                ':pulsar' => $pulsar,
+                ':imported_at_utc' => $now,
+                ':decision_at_utc' => $now,
+                ':decision_note' => $message,
+            ]);
+        }
+
+        // Always outdate any older pending or error runs for this pulsar, whether the
+        // current run_id was freshly inserted or an existing record was updated to error.
+        mark_older_runs_outdated(
+            $pdo, $pulsar, $runId, $now,
+            ['pending', 'error'],
+            'system_error',
+            'Outdated by newer error run '
+        );
+
+        $pdo->commit();
+    } catch (Throwable $error) {
+        $pdo->rollBack();
+        throw $error;
+    }
+
+    return find_run($config, $runId);
+}
+
 function find_run(array $config, $runId)
 {
     $pdo = db_conn($config);
     $stmt = $pdo->prepare('SELECT * FROM runs WHERE run_id = :run_id');
     $stmt->execute([':run_id' => $runId]);
     return $stmt->fetch() ?: null;
+}
+
+function list_runs_for_pulsar_with_statuses(array $config, $pulsar, array $statuses, $excludeRunId = null)
+{
+    $normalizedStatuses = [];
+    foreach ($statuses as $status) {
+        $value = trim((string) $status);
+        if ($value !== '') {
+            $normalizedStatuses[] = $value;
+        }
+    }
+    if (empty($normalizedStatuses)) {
+        return [];
+    }
+
+    $params = [':pulsar' => (string) $pulsar];
+    $statusPlaceholders = [];
+    foreach ($normalizedStatuses as $index => $status) {
+        $placeholder = ':status_' . $index;
+        $statusPlaceholders[] = $placeholder;
+        $params[$placeholder] = $status;
+    }
+
+    $sql = 'SELECT * FROM runs WHERE pulsar = :pulsar';
+    $excludeRunId = trim((string) $excludeRunId);
+    if ($excludeRunId !== '') {
+        $sql .= ' AND run_id <> :exclude_run_id';
+        $params[':exclude_run_id'] = $excludeRunId;
+    }
+    $sql .= ' AND status IN (' . implode(', ', $statusPlaceholders) . ')';
+    $sql .= ' ORDER BY COALESCE(run_generated_utc, imported_at_utc) DESC, id DESC';
+
+    $pdo = db_conn($config);
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute($params);
+    return $stmt->fetchAll();
 }
 
 function list_runs_with_rules(array $config)
