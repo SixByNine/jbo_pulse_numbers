@@ -44,7 +44,185 @@ function resolve_manifest_output_path($manifestPath, $value)
     return $manifestDir . '/' . ltrim($candidate, '/');
 }
 
-function mark_older_runs_outdated(PDO $pdo, $pulsar, $runId, $newRunSortUtc, array $statuses = ['pending'], $decisionBy = 'system_import', $notePrefix = 'Outdated by newer imported run ')
+function delete_pulsar_rule(PDO $pdo, $pulsar)
+{
+    $stmt = $pdo->prepare('DELETE FROM pulsar_rules WHERE pulsar = :pulsar');
+    $stmt->execute([':pulsar' => $pulsar]);
+    return $stmt->rowCount();
+}
+
+function delete_pulsar_rule_if_no_postponed_runs(PDO $pdo, $pulsar)
+{
+    $stmt = $pdo->prepare(
+        'SELECT COUNT(*)
+         FROM runs
+         WHERE pulsar = :pulsar
+           AND status = "postponed"'
+    );
+    $stmt->execute([':pulsar' => $pulsar]);
+    $count = (int) $stmt->fetchColumn();
+    if ($count > 0) {
+        return 0;
+    }
+
+    return delete_pulsar_rule($pdo, $pulsar);
+}
+
+function clear_postponed_state_for_pulsar_pdo(PDO $pdo, $pulsar, $actor, $note = '')
+{
+    $decisionAt = db_now_utc();
+    $cleanPulsar = trim((string) $pulsar);
+    if ($cleanPulsar === '') {
+        throw new RuntimeException('Pulsar is required.');
+    }
+
+    $noteValue = trim((string) $note);
+    if ($noteValue === '') {
+        $noteValue = 'Cleared postponed state for pulsar; postponed runs marked outdated.';
+    }
+
+    $update = $pdo->prepare(
+        'UPDATE runs
+         SET status = "outdated",
+             decision_at_utc = :decision_at_utc,
+             decision_by = :decision_by,
+             postpone_until_utc = NULL,
+             decision_note = :decision_note,
+             merged_at_utc = NULL,
+             merged_by = NULL,
+             merge_note = NULL
+         WHERE pulsar = :pulsar
+           AND status = "postponed"'
+    );
+    $update->execute([
+        ':decision_at_utc' => $decisionAt,
+        ':decision_by' => $actor,
+        ':decision_note' => $noteValue,
+        ':pulsar' => $cleanPulsar,
+    ]);
+
+    return [
+        'pulsar' => $cleanPulsar,
+        'outdated_runs' => $update->rowCount(),
+        'deleted_rules' => delete_pulsar_rule($pdo, $cleanPulsar),
+        'decision_at_utc' => $decisionAt,
+        'decision_by' => $actor,
+        'decision_note' => $noteValue,
+    ];
+}
+
+function clear_postponed_state_for_pulsar(array $config, $pulsar, $actor, $note = '')
+{
+    $pdo = db_conn($config);
+    $pdo->beginTransaction();
+    try {
+        $result = clear_postponed_state_for_pulsar_pdo($pdo, $pulsar, $actor, $note);
+        $pdo->commit();
+        return $result;
+    } catch (Throwable $error) {
+        $pdo->rollBack();
+        throw $error;
+    }
+}
+
+function cleanup_expired_postponed_state(array $config, $actor = 'system_cleanup')
+{
+    $pdo = db_conn($config);
+    $now = db_now_utc();
+    $expiredStmt = $pdo->prepare(
+        'SELECT pulsar, postpone_until_utc
+         FROM pulsar_rules
+         WHERE TRIM(COALESCE(postpone_until_utc, "")) <> ""
+           AND postpone_until_utc <= :now
+         ORDER BY postpone_until_utc ASC, pulsar ASC'
+    );
+    $expiredStmt->execute([':now' => $now]);
+    $expiredRules = $expiredStmt->fetchAll();
+
+    if (empty($expiredRules)) {
+        return ['expired_rules' => 0, 'outdated_runs' => 0, 'pulsars' => []];
+    }
+
+    $outdatedRuns = 0;
+    $clearedPulsars = [];
+    $pdo->beginTransaction();
+    try {
+        foreach ($expiredRules as $rule) {
+            $pulsar = (string) ($rule['pulsar'] ?? '');
+            if ($pulsar === '') {
+                continue;
+            }
+            $expiry = (string) ($rule['postpone_until_utc'] ?? '');
+            $result = clear_postponed_state_for_pulsar_pdo(
+                $pdo,
+                $pulsar,
+                $actor,
+                'Postpone timer expired at ' . $expiry . '; postponed runs marked outdated.'
+            );
+            $outdatedRuns += (int) $result['outdated_runs'];
+            $clearedPulsars[] = $pulsar;
+        }
+        $pdo->commit();
+    } catch (Throwable $error) {
+        $pdo->rollBack();
+        throw $error;
+    }
+
+    return [
+        'expired_rules' => count($clearedPulsars),
+        'outdated_runs' => $outdatedRuns,
+        'pulsars' => $clearedPulsars,
+    ];
+}
+
+function list_active_postponed_pulsars(array $config)
+{
+    cleanup_expired_postponed_state($config, 'system_cleanup');
+    $pdo = db_conn($config);
+    $now = db_now_utc();
+    $stmt = $pdo->prepare(
+        'SELECT pulsar, postpone_until_utc, source_run_id, updated_at_utc, updated_by
+         FROM pulsar_rules
+         WHERE TRIM(COALESCE(postpone_until_utc, "")) <> ""
+           AND postpone_until_utc > :now
+         ORDER BY postpone_until_utc ASC, pulsar ASC'
+    );
+    $stmt->execute([':now' => $now]);
+    return $stmt->fetchAll();
+}
+
+function get_active_postponed_rule_for_pulsar(array $config, $pulsar)
+{
+    cleanup_expired_postponed_state($config, 'system_cleanup');
+    $pdo = db_conn($config);
+    $now = db_now_utc();
+    $stmt = $pdo->prepare(
+        'SELECT *
+         FROM pulsar_rules
+         WHERE pulsar = :pulsar
+           AND TRIM(COALESCE(postpone_until_utc, "")) <> ""
+           AND postpone_until_utc > :now'
+    );
+    $stmt->execute([
+        ':pulsar' => trim((string) $pulsar),
+        ':now' => $now,
+    ]);
+    return $stmt->fetch() ?: null;
+}
+
+function is_pulsar_postponed(array $config, $pulsar)
+{
+    $rule = get_active_postponed_rule_for_pulsar($config, $pulsar);
+    return [
+        'pulsar' => trim((string) $pulsar),
+        'is_postponed' => $rule !== null,
+        'postpone_until_utc' => $rule['postpone_until_utc'] ?? null,
+        'source_run_id' => $rule['source_run_id'] ?? null,
+        'checked_at_utc' => db_now_utc(),
+    ];
+}
+
+function mark_older_runs_outdated(PDO $pdo, $pulsar, $runId, $newRunSortUtc, array $statuses = ['pending','error'], $decisionBy = 'system_import', $notePrefix = 'Outdated by newer imported run ')
 {
     $normalizedStatuses = [];
     foreach ($statuses as $status) {
@@ -160,6 +338,7 @@ function discard_run_due_to_manual_block(PDO $pdo, array $run, array $manualRun)
 
 function import_manifest(array $config, $manifestPath)
 {
+    cleanup_expired_postponed_state($config, 'system_import');
     $pdo = db_conn($config);
     $raw = file_get_contents($manifestPath);
     if ($raw === false) {
@@ -223,7 +402,8 @@ function import_manifest(array $config, $manifestPath)
 
         $inserted = $stmt->rowCount() > 0;
         if ($inserted) {
-            $outdatedCount = mark_older_runs_outdated($pdo, $pulsar, $runId, $newRunSortUtc, ['pending']);
+            $outdatedCount = mark_older_runs_outdated($pdo, $pulsar, $runId, $newRunSortUtc, ['pending', 'error', 'postponed']);
+            delete_pulsar_rule_if_no_postponed_runs($pdo, $pulsar);
             $manualRun = find_active_manual_run_for_pulsar($pdo, $pulsar);
             if ($manualRun && (string) $manualRun['run_id'] !== $runId) {
                 $blockedByManual = discard_run_due_to_manual_block($pdo, ['run_id' => $runId], $manualRun);
@@ -300,10 +480,7 @@ function import_single_run(array $config, $pulsar, $runId)
 
 function get_pulsar_rule(array $config, $pulsar)
 {
-    $pdo = db_conn($config);
-    $stmt = $pdo->prepare('SELECT * FROM pulsar_rules WHERE pulsar = :pulsar');
-    $stmt->execute([':pulsar' => $pulsar]);
-    return $stmt->fetch() ?: null;
+    return get_active_postponed_rule_for_pulsar($config, $pulsar);
 }
 
 function decide_run(array $config, $runId, $action, $actor, $postponeUntil, $note)
@@ -375,6 +552,8 @@ function decide_run(array $config, $runId, $action, $actor, $postponeUntil, $not
                 ':updated_at_utc' => $decisionAt,
                 ':updated_by' => $actor,
             ]);
+        } else {
+            delete_pulsar_rule_if_no_postponed_runs($pdo, $run['pulsar']);
         }
 
         if ($action === 'accept') {
@@ -445,6 +624,40 @@ function mark_run_merged(array $config, $runId, $actor, $mergeNote)
     ]);
 
     return find_run($config, $runId);
+}
+
+function clear_pending_runs_for_pulsar(array $config, $pulsar, $actor, $note = '')
+{
+    $pdo = db_conn($config);
+    $decisionAt = db_now_utc();
+    $noteValue = trim((string) $note);
+    if ($noteValue === '') {
+        $noteValue = 'Cleared pending runs for pulsar while awaiting replacement.';
+    }
+
+    $update = $pdo->prepare(
+        'UPDATE runs
+         SET status = "outdated",
+             decision_at_utc = :decision_at_utc,
+             decision_by = :decision_by,
+             postpone_until_utc = NULL,
+             decision_note = :decision_note,
+             merged_at_utc = NULL,
+             merged_by = NULL,
+             merge_note = NULL
+         WHERE pulsar = :pulsar
+           AND status = "pending"'
+    );
+    $update->execute([
+        ':decision_at_utc' => $decisionAt,
+        ':decision_by' => $actor,
+        ':decision_note' => $noteValue,
+        ':pulsar' => $pulsar,
+    ]);
+
+    delete_pulsar_rule_if_no_postponed_runs($pdo, $pulsar);
+
+    return $update->rowCount();
 }
 
 function clear_manual_run(array $config, $actor, $runId = null, $pulsar = null, $note = '')
@@ -546,6 +759,7 @@ function update_manual_decision_note(array $config, $runId, $note)
 
 function log_error_run(array $config, $pulsar, $runId, $message)
 {
+    cleanup_expired_postponed_state($config, 'system_error');
     $pdo = db_conn($config);
     $now = db_now_utc();
 
@@ -592,10 +806,11 @@ function log_error_run(array $config, $pulsar, $runId, $message)
         // current run_id was freshly inserted or an existing record was updated to error.
         mark_older_runs_outdated(
             $pdo, $pulsar, $runId, $now,
-            ['pending', 'error'],
+            ['pending', 'error', 'postponed'],
             'system_error',
             'Outdated by newer error run '
         );
+        delete_pulsar_rule_if_no_postponed_runs($pdo, $pulsar);
 
         $pdo->commit();
     } catch (Throwable $error) {
@@ -652,6 +867,7 @@ function list_runs_for_pulsar_with_statuses(array $config, $pulsar, array $statu
 
 function list_runs_with_rules(array $config)
 {
+    cleanup_expired_postponed_state($config, 'system_cleanup');
     $pdo = db_conn($config);
     $sql = 'SELECT r.*, pr.postpone_until_utc AS pulsar_postpone_until_utc
             FROM runs r

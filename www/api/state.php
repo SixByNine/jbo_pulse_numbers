@@ -14,6 +14,7 @@ if ($configuredKey !== '') {
 
 $pdo = db_conn($APP_CONFIG);
 $runs = list_runs_with_rules($APP_CONFIG);
+$activePostponedPulsars = list_active_postponed_pulsars($APP_CONFIG);
 $pulsarFilter = isset($_GET['pulsar']) ? trim((string) $_GET['pulsar']) : '';
 $statusFilter = isset($_GET['status']) ? trim((string) $_GET['status']) : '';
 $manualOnly = isset($_GET['manual_only'])
@@ -82,6 +83,7 @@ $payload = [
     'manual_pulsars' => array_values($manualPulsars),
     'error_runs' => $errorRuns,
     'pulsar_rules' => $pulsarRules,
+    'active_postponed_pulsars' => $activePostponedPulsars,
 ];
 
 header('Content-Type: application/json');

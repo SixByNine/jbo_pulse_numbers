@@ -4,14 +4,16 @@
 
 
 usage() {
-    echo "Usage: $0 [-3|--cubic] [-2|--no-cubic] [--no-pm] [-i|--interactive] [-n|--no-upload] [-f|--force] [--clear-manual] [pulsar_directory_or_name]"
+    echo "Usage: $0 [-3|--cubic] [-2|--no-cubic] [--no-pm] [-i|--interactive] [-n|--no-auto] [--no-upload] [-f|--force] [--clear-manual] [--clear-postponed] [pulsar_directory_or_name]"
 }
 pulsar_base_dir="${TIMING_PULSAR_BASE_DIR:-$(pwd)}"
 
 interactive_flag="0"
 upload_flag="1"
 force_flag="0"
+auto_flag="1"
 clear_manual_flag="0"
+clear_postponed_flag="0"
 psrdir=""
 mean_poly_order=3
 fit_pm_flag="--fit-pm"
@@ -34,7 +36,12 @@ while [[ $# -gt 0 ]] ; do
             interactive_flag="1"
             shift
             ;;
-        -n|--no-upload)
+        -n|--no-auto)
+            upload_flag="0"
+            auto_flag="0"
+            shift
+            ;;
+        --no-upload)
             upload_flag="0"
             shift
             ;;
@@ -44,6 +51,10 @@ while [[ $# -gt 0 ]] ; do
             ;;
         --clear-manual)
             clear_manual_flag="1"
+            shift
+            ;;
+        --clear-postponed)
+            clear_postponed_flag="1"
             shift
             ;;
         -h|--help)
@@ -113,6 +124,11 @@ if [[ "$clear_manual_flag" == "1" ]]; then
     "$scriptdir/manual_followup.py" --clear "$pulsar_name"
 fi
 
+if [[ "$clear_postponed_flag" == "1" ]]; then
+    echo "Clearing postponed status for $pulsar_name"
+    "$scriptdir/postponed_followup.py" --clear "$pulsar_name"
+fi
+
 manual_status=$(python3 "$scriptdir/manual_followup.py" "$pulsar_name") || exit $?
 if [[ "$manual_status" == *"manual_active"* ]] ; then
     if [[ "$force_flag" != "1" ]] ; then
@@ -121,6 +137,18 @@ if [[ "$manual_status" == *"manual_active"* ]] ; then
     fi
     if [[ "$upload_flag" != "0" ]] ; then
         echo "Manual follow-up is active for $pulsar_name. Continuing because --force was used; upload disabled."
+    fi
+    upload_flag="0"
+fi
+
+postponed_status=$(python3 "$scriptdir/postponed_followup.py" "$pulsar_name") || exit $?
+if [[ "$postponed_status" == *"postponed_active"* ]] ; then
+    if [[ "$force_flag" != "1" ]] ; then
+        echo "Postponed state is active for $pulsar_name. Aborting. Use --force to continue without upload." >&2
+        exit 1
+    fi
+    if [[ "$upload_flag" != "0" ]] ; then
+        echo "Postponed state is active for $pulsar_name. Continuing because --force was used; upload disabled."
     fi
     upload_flag="0"
 fi
@@ -141,13 +169,18 @@ cd dfb_data || exit 1
 # Create symlinks to DFB files not already there.
 
 for f in ../data_dir/dfb/J??????_??????.FT ; do
-    l=$(basename $f)
-    if [[ -e bad.list ]] && grep -q "^$l$" bad.list ; then
-        echo "Skipping bad file $f"
+    l=$(basename $f .FT)
+    if compgen -G "${l}_harmonic_*" > /dev/null ; then
+        echo "Skipping $l because a harmonic version exists"
+        continue
+    fi
+    if [[ -e bad.list ]] && grep -q "^${l}" bad.list ; then
+        reason=$(grep "^${l}" bad.list)
+        echo "Skipping bad file ${reason}"
         continue
     fi
     if [[ "$l" < "J2407" ]] ; then
-        if [[ ! -e $l ]] ; then
+        if [[ ! -e ${l}.FT ]] ; then
             ln -s $f .
         fi
     fi
@@ -156,11 +189,21 @@ done
 # get and scrunch the roach data
 for f in ../data_dir/roach/2???*.ft ; do
     l=$(basename $f .ft)
+    if [[ -e bad.list ]] && grep -q "^${l}" bad.list ; then
+        reason=$(grep "^${l}" bad.list)
+        echo "Skipping bad file ${reason}"
+        continue
+    fi
     if [[ "$l" > "202306" ]] ; then
         newf=ROACH_${l}.FT
-        if [[ ! -e $newf ]] ; then
-            pam -FTp -u . -e FTnew $f
-            mv ${l}.FTnew $newf
+        # check if a file exists like ${newf} or ${l}_h*.FT
+        if [[ ! -e $newf ]] && ! compgen -G "ROACH_${l}_harmonic_*.FT" > /dev/null ; then
+            if [[ -e ${f%.ft}.FTp_cf ]] ; then
+                ln -s ${f%.ft}.FTp_cf $newf
+            else
+                pam -FTp -u . -e FTnew $f
+                mv ${l}.FTnew $newf
+            fi
         fi
     fi
 done
@@ -194,13 +237,21 @@ fi
 sed -i -e "s:^ C :C :" best.tim
 
 last_dfb=$(grep -v "^C" best.tim | grep -e "J......_......" | sed -e "s:FTp:FT:" |  tail -n 1 | awk '{print $1}')
-last_roach=$(grep -v "^C" best.tim | grep -e "ROACH_" | sed -e "s:FTp:FT:" |  tail -n 1 | awk '{print $1}')
+last_roach=$(grep -v "^C" best.tim | grep -e "ROACH_" | grep -v "harmonic" | sed -e "s:FTp:FT:" |  tail -n 1 | awk '{print $1}')
+last_roach_harmonic=$(grep -v "^C" best.tim | grep -e "ROACH_.*harmonic" | sed -e "s:FTp:FT:" |  tail -n 1 | awk '{print $1}')
 if [[ -z "$last_roach" ]];  then
     last_roach="none"
-    newfiles_ROACH=$(ls dfb_data/ROACH_*.FT)
+    newfiles_ROACH=$(ls dfb_data/ROACH_*.FT | grep -v "harmonic")
 else
-    newfiles_ROACH=$(ls dfb_data/ROACH_*.FT | sed "0,\\:$last_roach:d")
+    newfiles_ROACH=$(ls dfb_data/ROACH_*.FT | grep -v "harmonic" | sed "0,\\:$last_roach:d")
 fi
+if [[ -z "$last_roach_harmonic" ]];  then
+    last_roach_harmonic=""
+    newfiles_ROACH_harmonic=$(ls dfb_data/ROACH_*harmonic*.FT)
+else
+    newfiles_ROACH_harmonic=$(ls dfb_data/ROACH_*harmonic*.FT | sed "0,\\:$last_roach_harmonic:d")
+fi
+
 if [[ -z "$last_dfb" ]] ; then
     last_dfb='none'
     newfiles_DFB=$(ls dfb_data/J??????_??????.FT )
@@ -209,21 +260,26 @@ else
 fi
 echo "Last DFB file: $last_dfb"
 echo "Last ROACH file: $last_roach"
+if [[ -n "$last_roach_harmonic" ]]; then
+    echo "Last ROACH harmonic file: $last_roach_harmonic"
+fi
 
 trusted_file="best.tim"
 
 # If any new DFB files, we haven't updated since 2023, so the old data should be checked for dlyfix issues.
-if [[ -n "$newfiles_DFB" ]] ; then
+last_dfb_basename=$(basename "$last_dfb")
+if [[ "$last_dfb_basename" < "J24" ]] ; then
     
     echo "The DFB data may be out of date. Checking dlyfix"
     cd dfb_data
-    rm -f *.dlyfix
-    for i in J*.FT ; do
+    # deliberately avoid harmonic files, i.e. J*_harmonic*.FT
+    rm -f J??????_??????.dlyfix
+    for i in J??????_??????.FT ; do
         ~/dlyfix/dlyfix $i -e dlyfix > /dev/null
     done
 
     cd $psrdir
-    files=$(for i in dfb_data/J*.FT ; do d=dfb_data/$(basename $i .FT).dlyfix ; if [[ -e $d ]] ; then echo $d ; else echo $i ; fi ; done )
+    files=$(for i in dfb_data/J??????_??????.FT ; do d=dfb_data/$(basename $i .FT).dlyfix ; if [[ -e $d ]] ; then echo $d ; else echo $i ; fi ; done )
 
     pat -A SIS -f tempo2 -s $std $files | sed -e "s:jbdfb:jbdfb -be jbdfb:g" > jdfb_new.tim
     ndly=$(grep dlyfix jdfb_new.tim | wc -l)
@@ -274,13 +330,15 @@ if [[ -n "$newfiles_DFB" ]] ; then
     done > jbdfb_pn.tim
 
     wc -l best.tim
+    grep "jbdfb" best.tim | grep "harmonic" > jdfb_harmonic.tim
     grep -v jbdfb best.tim > tmp.tim
-    sort -nk3 tmp.tim jbdfb_pn.tim > jbdfb_fix.tim
+    sort -nk3 tmp.tim jdfb_harmonic.tim jbdfb_pn.tim > jbdfb_fix.tim
 
     wc -l jbdfb_fix.tim
     trusted_file="jbdfb_fix.tim"
 
-
+else
+    echo "The DFB data appears to be up to date, skipping dlyfix check and pulse number fix for DFB data."
 fi
 
 cd $psrdir
@@ -290,8 +348,8 @@ cd $psrdir
 rm -f update.pdf updated.tim update.stats
 
 
-echo "New files: $newfiles_DFB $newfiles_ROACH"
-if [[ -n "$newfiles_DFB" ]] || [[ -n "$newfiles_ROACH" ]] ; then
+echo "New files: $newfiles_DFB $newfiles_ROACH $newfiles_ROACH_harmonic"
+if [[ -n "$newfiles_DFB" ]] || [[ -n "$newfiles_ROACH" ]]  || [[ -n "$newfiles_ROACH_harmonic" ]]; then
 
 
     wd=$(pwd)
@@ -320,8 +378,26 @@ if [[ -n "$newfiles_DFB" ]] || [[ -n "$newfiles_ROACH" ]] ; then
 
     rm updates/*
 
-    pat -A SIS -f tempo2 -s $std $newfiles | sed -e "s:jbdfb:jbdfb -be jbdfb:g" | sed -e "s:roach:roach -be jbroach:g" | grep -v nan > updates/jdfb_update.tim
-    cat $trusted_file updates/jdfb_update.tim > updates/extended.tim
+    pat -A SIS -f tempo2 -s $std $newfiles | sed -e "s:jbdfb:jbdfb -be jbdfb:g" | sed -e "s:roach:roach -be jbroach:g" | grep -v nan > updates/pat.tim
+
+    for f in $newfiles_ROACH_harmonic ; do
+        harmonic_number=$(echo "$f" | sed -e 's/.*harmonic_\([0-9]\+\).FT/\1/')
+        echo "Harmonic data... $f @ harm = $harmonic_number"
+        
+        harmonic_template="dfb_data/harm${harmonic_number}_1520.std"
+        if [[ ! -e "$harmonic_template" ]]; then
+            echo "Harmonic template not found: $harmonic_template, generating..." >&2
+            $scriptdir/make_harmonic_template.py $std --harmonic-number $harmonic_number --output "$harmonic_template"
+            if [[ ! -e "$harmonic_template" ]]; then
+                echo "Failed to generate harmonic template: $harmonic_template, skipping." >&2
+                exit 1
+            fi
+        fi
+        pat -FT -A SIS -f tempo2 -s $harmonic_template $f | tail -n 1 | sed -e "s:roach:roach -be jbroach -harmonic ${harmonic_number} -tmplt $harmonic_template:g" | grep -v nan >> updates/pat.tim
+    done
+
+
+    sort -nk3 $trusted_file updates/pat.tim > updates/extended.tim
 
     grep -v -F -- "-distrust" $trusted_file > updates/trusted.tim
 
@@ -357,8 +433,14 @@ if [[ -n "$newfiles_DFB" ]] || [[ -n "$newfiles_ROACH" ]] ; then
         cp ../timing_dir/ephindex.dat .
         ephindex_opt=(--ephindex ephindex.dat)
     fi
-    tempo2 -output add_pulseNumber -f update.par extended.tim
+    tempo2 -output add_pulseNumber -f update.par extended.tim -nofit
 
+
+    if [[ $auto_flag -eq 0 ]]; then
+        echo "No automatic processing by user request... Exiting after pulse number extrapolation step. The updated tim file with extrapolated pulse numbers is updates/withpn.tim"
+        exit
+    fi
+        
     run_id="${pulsar_name}_$(date -u +'%Y%m%d_%H%M%S')"
     stage_root="$psrdir/updates/review_runs"
 

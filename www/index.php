@@ -4,6 +4,7 @@ require_login();
 
 $runs = list_runs_with_rules($APP_CONFIG);
 $pending = list_pending_runs_for_review($APP_CONFIG);
+$activePostponedPulsars = list_active_postponed_pulsars($APP_CONFIG);
 $blocked = [];
 $decided = [];
 $manualRuns = [];
@@ -70,7 +71,7 @@ foreach ($runs as $run) {
 <main>
   <div class="grid">
     <div class="card"><h3>Pending</h3><p><?php echo count($pending); ?></p></div>
-    <div class="card"><h3>Blocked by postpone date</h3><p><?php echo count($blocked); ?></p></div>
+    <div class="card"><h3>Active postponed pulsars</h3><p><?php echo count($activePostponedPulsars); ?></p></div>
     <div class="card"><h3>Decided</h3><p><?php echo count($decided); ?></p></div>
     <div class="card"><h3>Processing errors</h3><p><?php echo count($errorRuns); ?></p></div>
     <div class="card"><h3>Hidden terminal</h3><p><?php echo count($hiddenTerminal) + count($outdated); ?></p></div>
@@ -147,8 +148,24 @@ foreach ($runs as $run) {
     </table>
   </div>
 
-   <div class="card">
-    <h2>Postponed Updates</h2>
+  <div class="card">
+    <h2>Active postpone rules</h2>
+    <table>
+      <tr><th>Pulsar</th><th>Postpone until</th><th>Source run</th><th>Updated at</th><th>Updated by</th></tr>
+      <?php foreach ($activePostponedPulsars as $rule): ?>
+        <tr>
+          <td><?php echo htmlspecialchars((string) ($rule['pulsar'] ?? '')); ?></td>
+          <td><?php echo htmlspecialchars((string) ($rule['postpone_until_utc'] ?? '')); ?></td>
+          <td><?php echo htmlspecialchars((string) ($rule['source_run_id'] ?? '')); ?></td>
+          <td><?php echo htmlspecialchars((string) ($rule['updated_at_utc'] ?? '')); ?></td>
+          <td><?php echo htmlspecialchars((string) ($rule['updated_by'] ?? '')); ?></td>
+        </tr>
+      <?php endforeach; ?>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Pending runs blocked by postpone rule</h2>
     <table>
       <tr><th>Pulsar</th><th>Run</th><th>Generated</th><th>Postpone until</th><th>Action</th></tr>
       <?php foreach ($blocked as $run): ?>

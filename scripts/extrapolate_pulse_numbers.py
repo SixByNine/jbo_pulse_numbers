@@ -136,9 +136,10 @@ def read_gp_parameters(par_path):
             if not line or line.startswith("#"):
                 continue
             fields = line.split()
-            if fields[0] in {"TNRedAmp", "TNRedGam", "F0"}:
+            if fields[0] in {"TNRedAmp", "TNRedGam", "F0", "PB"}:
                 parameters[fields[0]] = float(fields[1])
 
+    # Validate that all required red-noise parameters are present.  (PB etc not needed.)
     missing = {"TNRedAmp", "TNRedGam", "F0"} - set(parameters)
     if missing:
         missing_names = ", ".join(sorted(missing))
@@ -769,27 +770,27 @@ def parse_tim_line(line):
 
 
 def update_pulse_number(line, wrap):
-    if wrap == 0:
-        return line
-    else:
-        tokens = line.split()
-        cleaned = []
-        index = 0
-        
-        while index < len(tokens):
-            token = tokens[index]
-            if token == "-pn":
-                current_pn = np.int64(tokens[index + 1])
-                index += 2
-                continue
-            cleaned.append(token)
-            index += 1
+    tokens = line.split()
+    cleaned = []
+    index = 0
+    
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-pn":
+            current_pn = np.int64(tokens[index + 1])
+            index += 2
+            continue
+        if token == "-distrust":
+            index += 2
+            continue
+        cleaned.append(token)
+        index += 1
 
-        cleaned.extend(["-pn", str(current_pn-np.int64(wrap))])
-        return " ".join(cleaned)
+    cleaned.extend(["-pn", str(current_pn-np.int64(wrap))])
+    return " ".join(cleaned)
 
 
-def write_updated_tim(input_tim_path, output_tim_path, diagnostics):
+def write_updated_tim(input_tim_path, output_tim_path, diagnostics, trusted):
     decisions = [
         {
             "time": float(row["time"]),
@@ -821,8 +822,7 @@ def write_updated_tim(input_tim_path, output_tim_path, diagnostics):
                 output_handle.write(raw_line)
                 continue
 
-            if remaining_inliers == 0:
-                break
+            
 
             # Find best matching decision by identifier, then time/frequency
             best_index = None
@@ -841,11 +841,29 @@ def write_updated_tim(input_tim_path, output_tim_path, diagnostics):
                 if best_key is None or candidate_key < best_key:
                     best_index = index
                     best_key = candidate_key
+            best_trusted=False
+            for trusted_id,trusted_time,trusted_freq in zip(trusted["identifiers"], trusted["times"], trusted["frequencies_mhz"]):
+                if trusted_id != toa_identifier:
+                    continue
+                time_delta = abs(trusted_time - toa_time)
+                frequency_delta = abs(trusted_freq - toa_frequency) if np.isfinite(trusted_freq) and toa_frequency is not None else float("inf")
+                candidate_key = (time_delta, frequency_delta)
+                if best_key is None or candidate_key < best_key:
+                    best_key = candidate_key
+                    best_trusted = True
 
-            if best_index is None:
+            
+            if best_trusted:
                 output_handle.write(raw_line)
                 continue
 
+            if remaining_inliers == 0:
+                continue
+
+            if best_index is None:
+                raise ValueError(f"No matching decision found for TIM line with identifier={toa_identifier} time={toa_time:.8f} frequency={toa_frequency}")
+            
+            
             decision = decisions[best_index]
             decision["used"] = True
 
@@ -858,8 +876,6 @@ def write_updated_tim(input_tim_path, output_tim_path, diagnostics):
                 remaining_inliers -= 1
             output_handle.write(updated + "\n")
 
-            if remaining_inliers == 0:
-                break
 
 
 def solve_with_constraints(all_times, wrapped_phase, phase_sigma, trusted_mask, new_indices, covariance, wrap_options, args, constraints=None):
@@ -901,7 +917,7 @@ def add_glitch_markers(axes, glitch_epochs):
         axis.set_xlim(x_min, x_max)
 
 
-def plot_diagnostics(times, phase_sigma, wrapped_phase, diagnostics, trusted_mask, new_indices, output_path, glitch_epochs=None):
+def plot_diagnostics(times, phase_sigma, wrapped_phase, diagnostics, trusted_mask, new_indices, output_path, glitch_epochs=None, binary_period=None):
     """Generate diagnostic plot showing residuals, predictions, and outlier flags."""
     if not HAS_MATPLOTLIB:
         return None
@@ -975,7 +991,18 @@ def plot_diagnostics(times, phase_sigma, wrapped_phase, diagnostics, trusted_mas
     ax1.set_ylabel('phase (unwrapped)', fontsize=11)
     ax1.set_title('Wrapped Phase Observations with Predictions', fontsize=12, fontweight='bold')
     ax1.legend(loc='best', fontsize=10)
-
+    if binary_period is not None:
+        ax1.text(
+            0.02,
+            0.02,
+            f'binary period: {binary_period}',
+            transform=ax1.transAxes,
+            fontsize=10,
+            va='top',
+            ha='left',
+            bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7, edgecolor='none'),
+        )
+    
     # Add faint horizontal lines at every integer y-value in view.
     y_min_1, y_max_1 = ax1.get_ylim()
     if y_max_1 - y_min_1 < 1000: 
@@ -1515,7 +1542,8 @@ def main():
             return
 
     write_diagnostics(diagnostics, output_path)
-    write_updated_tim(newtim_path, output_tim_path, diagnostics)
+    trusted = dict(times=times[trusted_mask], identifiers=identifiers[trusted_mask], frequencies_mhz=frequencies_mhz[trusted_mask])
+    write_updated_tim(newtim_path, output_tim_path, diagnostics, trusted)
     plot_path = plot_diagnostics(
         times,
         phase_sigma,
@@ -1525,6 +1553,7 @@ def main():
         new_indices,
         output_path,
         glitch_epochs=glitch_index,
+        binary_period=gp_parameters.get("PB",None),
     )
     print_summary(best_particle, diagnostics)
     trusted_count = int(np.sum(trusted_mask))
