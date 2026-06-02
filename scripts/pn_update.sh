@@ -4,7 +4,7 @@
 
 
 usage() {
-    echo "Usage: $0 [-3|--cubic] [-2|--no-cubic] [--no-pm] [-i|--interactive] [-n|--no-auto] [--no-upload] [-f|--force] [--clear-manual] [--clear-postponed] [pulsar_directory_or_name]"
+    echo "Usage: $0 [-3|--cubic] [-2|--no-cubic] [--no-pm] [-i|--interactive] [-n|--no-auto] [--no-upload] [-f|--force] [--clear-manual] [--clear-postponed] [--check-trusted] [[--skip-recent]] [pulsar_directory_or_name]"
 }
 pulsar_base_dir="${TIMING_PULSAR_BASE_DIR:-$(pwd)}"
 
@@ -14,6 +14,8 @@ force_flag="0"
 auto_flag="1"
 clear_manual_flag="0"
 clear_postponed_flag="0"
+check_trusted_flag="0"
+skip_recent_flag="0"
 psrdir=""
 mean_poly_order=3
 fit_pm_flag="--fit-pm"
@@ -55,6 +57,14 @@ while [[ $# -gt 0 ]] ; do
             ;;
         --clear-postponed)
             clear_postponed_flag="1"
+            shift
+            ;;
+        --check-trusted)
+            check_trusted_flag="1"
+            shift
+            ;;
+        --skip-recent)
+            skip_recent_flag="1"
             shift
             ;;
         -h|--help)
@@ -104,6 +114,14 @@ cd $psrdir
 
 psrdir=$(pwd)
 pulsar_name=$(basename "$psrdir")
+
+if [[ "$skip_recent_flag" == "1" ]]; then
+    # Check file modification date on best.tim is within the last 7 days; if so, exit without doing anything.
+    if [[ -f best.tim ]] && [[ $(find best.tim -mtime -7) ]]; then
+        echo "Skipping $pulsar_name because best.tim was modified within the last 7 days."
+        exit 0
+    fi
+fi
 
 report_processing_error() {
     local error_message="$1"
@@ -189,8 +207,8 @@ done
 # get and scrunch the roach data
 for f in ../data_dir/roach/2???*.ft ; do
     l=$(basename $f .ft)
-    if [[ -e bad.list ]] && grep -q "^${l}" bad.list ; then
-        reason=$(grep "^${l}" bad.list)
+    if [[ -e bad.list ]] && grep -q "${l}" bad.list ; then
+        reason=$(grep "${l}" bad.list)
         echo "Skipping bad file ${reason}"
         continue
     fi
@@ -377,6 +395,53 @@ if [[ -n "$newfiles_DFB" ]] || [[ -n "$newfiles_ROACH" ]]  || [[ -n "$newfiles_R
     mkdir -p updates
 
     rm updates/*
+    new_42ft=""
+    last_42ft=$(awk '$1 != "C" && /jbcobra2/ {last=$1} END {print last}' best.tim)
+    if [[ -n "$last_42ft" ]] ; then
+        echo "Check for updated 42ft data"
+        if [[ -e timing_dir/cobra2.tim ]] ; then 
+            while IFS= read -r line ; do
+                # Example line format:
+                # 20120114_011416   0 1    610.0000  55940.0521458182478    0.00  485.70        i
+
+                if [[ -z "${line//[[:space:]]/}" ]] ; then
+                    continue
+                fi
+
+                if [[ "$line" =~ ^[[:space:]]*# ]] || [[ "$line" =~ ^[[:space:]]*C([[:space:]]|$) ]] ; then
+                    continue
+                fi
+                set -- $line
+
+
+                toa=$5
+                freq=$4
+                err=$7
+
+                date=$1
+                if [[ -z "$date" || -z "$freq" || -z "$toa" || -z "$err" ]] ; then
+                    continue
+                fi
+
+                if [[ "$date" < "$last_42ft" || "$date" == "$last_42ft" ]] ; then
+                    continue
+                fi
+
+                site="jb42"
+                be="jbcobra2"
+                
+
+                echo " " $date $freq $toa $err $site -be $be >> updates/cobra2_new.tim
+            done < timing_dir/cobra2.tim
+            if [[ -e updates/cobra2_new.tim ]] ; then
+                echo "There are $(wc -l < updates/cobra2_new.tim) new 42ft ToAs"
+                new_42ft="cobra2_new.tim"
+            fi
+        fi
+    fi
+
+
+
 
     pat -A SIS -f tempo2 -s $std $newfiles | sed -e "s:jbdfb:jbdfb -be jbdfb:g" | sed -e "s:roach:roach -be jbroach:g" | grep -v nan > updates/pat.tim
 
@@ -397,9 +462,7 @@ if [[ -n "$newfiles_DFB" ]] || [[ -n "$newfiles_ROACH" ]]  || [[ -n "$newfiles_R
     done
 
 
-    sort -nk3 $trusted_file updates/pat.tim > updates/extended.tim
-
-    grep -v -F -- "-distrust" $trusted_file > updates/trusted.tim
+    cp $trusted_file updates/raw_trusted.tim
 
     cd updates
 
@@ -414,6 +477,21 @@ if [[ -n "$newfiles_DFB" ]] || [[ -n "$newfiles_ROACH" ]]  || [[ -n "$newfiles_R
         echo "No par file to use for pulse number extrapolation. Exiting."
         exit 1
     fi
+
+    if [[ $check_trusted_flag -eq 1 ]]; then
+        # call tempo2 with the -output flagOutliers plugin, which creates flagOutliers.tim with extra -distrust flags.
+        tempo2 -f update.par raw_trusted.tim -output flagOutliers
+        if [[ -e flagOutliers.tim ]]; then
+            mv flagOutliers.tim raw_trusted.tim
+        else
+            echo "Warning: check_trusted was requested but flagOutliers.tim was not created. Continuing with original trusted.tim."
+        fi
+    fi
+
+    sort -nk3 raw_trusted.tim pat.tim $new_42ft > extended.tim
+
+    grep -v -F -- "-distrust" raw_trusted.tim > trusted.tim
+
 
     if grep -Fq "jbroach" extended.tim; then
         # Check if there are efac/equad and jump parameters for the roach in the par file

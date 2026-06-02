@@ -33,6 +33,7 @@ import run_enterprise.spectrum.cholspec as cholspec
 
 # Angular frequency for the annual sinusoid used in position / proper-motion terms (rad day^-1).
 _OMEGA_PER_DAY = 2.0 * np.pi / 365.25
+_DAYS_PER_YEAR = 365.25
 
 
 def ensure_interactive_matplotlib_backend():
@@ -90,6 +91,18 @@ def parse_args():
     parser.add_argument("--tim", required=True, help="tim file with trusted pulse numbers")
     parser.add_argument("--newtim", required=True, help="tim file containing new data to associate")
     parser.add_argument("--fc-yr", type=float, default=0.02, help="corner frequency in yr^-1 for the red-noise covariance")
+    parser.add_argument(
+        "--prediction-window-years",
+        type=float,
+        default=12.0,
+        help="half-width of the symmetric time window (years) used to select observations for each prediction",
+    )
+    parser.add_argument(
+        "--prediction-min-observations",
+        type=int,
+        default=100,
+        help="minimum number of observations used for each prediction; nearest observations are added if the window contains fewer",
+    )
     parser.add_argument("--covariance-scale", type=float, default=1.0, help="scale factor applied to the GP covariance matrix to tune predictive confidence")
     parser.add_argument("--wrap-min", type=int, default=-10, help="minimum integer wrap hypothesis")
     parser.add_argument("--wrap-max", type=int, default=10, help="maximum integer wrap hypothesis")
@@ -348,6 +361,55 @@ def build_mean_design(times, poly_order, reference_time, time_scale, fit_pos, fi
     return np.column_stack(columns)
 
 
+def select_predictive_history(
+    candidate_index,
+    observed_indices,
+    observed_values,
+    all_times,
+    all_frequency_mhz,
+    window_years,
+    min_observations,
+):
+    if not observed_indices:
+        return observed_indices, observed_values
+
+    history_indices = np.asarray(observed_indices, dtype=int)
+    history_values = np.asarray(observed_values, dtype=float)
+    times = np.asarray(all_times, dtype=float)
+    frequencies_mhz = None if all_frequency_mhz is None else np.asarray(all_frequency_mhz, dtype=float)
+
+    window_days = float(window_years) * _DAYS_PER_YEAR
+    target_time = float(times[candidate_index])
+    absolute_time_offset = np.abs(times[history_indices] - target_time)
+
+    in_window_positions = np.flatnonzero(absolute_time_offset <= window_days)
+    if len(in_window_positions) >= int(min_observations):
+        selected_positions = in_window_positions
+    else:
+        target_count = min(max(1, int(min_observations)), len(history_indices))
+        nearest_positions = np.argsort(absolute_time_offset, kind="mergesort")[:target_count]
+        selected_positions = np.sort(nearest_positions)
+
+    if frequencies_mhz is not None and len(selected_positions) > 0:
+        selected_frequencies = frequencies_mhz[history_indices[selected_positions]]
+        low_frequency_mask = selected_frequencies < 1000.0
+        low_frequency_positions = selected_positions[low_frequency_mask]
+        if len(low_frequency_positions) > int(min_observations):
+            low_frequency_offsets = absolute_time_offset[low_frequency_positions]
+            keep_order = np.argsort(low_frequency_offsets, kind="mergesort")[: int(min_observations)]
+            keep_low_frequency_positions = set(low_frequency_positions[keep_order].tolist())
+            selected_positions = np.asarray(
+                [
+                    position
+                    for position in selected_positions
+                    if position not in low_frequency_positions or position in keep_low_frequency_positions
+                ],
+                dtype=int,
+            )
+
+    return history_indices[selected_positions].tolist(), history_values[selected_positions].tolist()
+
+
 def predictive_observation_stats(candidate_index, observed_indices, observed_values, covariance, noise_variance, all_times, mean_poly_order, fit_pos=False, fit_pm=False):
     prior_mean = 0.0
     prior_variance = covariance[candidate_index, candidate_index] + noise_variance[candidate_index]
@@ -476,6 +538,7 @@ def process_single_observation(
     all_times,
     covariance,
     noise_variance,
+    all_frequency_mhz,
     wrap_options,
     wrap_to_index,
     args,
@@ -492,10 +555,19 @@ def process_single_observation(
     proposal_log_weight_total = -np.inf
 
     for particle in particles:
-        predictive_mean, predictive_variance = predictive_observation_stats(
+        selected_indices, selected_values = select_predictive_history(
             observation_index,
             particle.observed_indices,
             particle.observed_values,
+            all_times,
+            all_frequency_mhz,
+            args.prediction_window_years,
+            args.prediction_min_observations,
+        )
+        predictive_mean, predictive_variance = predictive_observation_stats(
+            observation_index,
+            selected_indices,
+            selected_values,
             covariance,
             noise_variance,
             all_times,
@@ -659,6 +731,7 @@ def associate_phases(
             all_times,
             covariance,
             noise_variance,
+            frequency_mhz,
             wrap_options,
             wrap_to_index,
             args,
@@ -1441,6 +1514,12 @@ def main():
         raise FileNotFoundError(f"Newtim file not found: {newtim_path}")
     if args.covariance_scale <= 0.0:
         raise ValueError(f"Covariance scale must be positive, got {args.covariance_scale}")
+    if args.prediction_window_years <= 0.0:
+        raise ValueError(f"Prediction window must be positive, got {args.prediction_window_years}")
+    if args.prediction_min_observations < 1:
+        raise ValueError(
+            f"Minimum predictive observations must be at least 1, got {args.prediction_min_observations}"
+        )
     
     gp_parameters = read_gp_parameters(par_path)
     wrap_options = np.arange(args.wrap_min, args.wrap_max + 1, dtype=int)
@@ -1576,6 +1655,8 @@ def main():
         },
         "parameters": {
             "fc_yr": args.fc_yr,
+            "prediction_window_years": args.prediction_window_years,
+            "prediction_min_observations": args.prediction_min_observations,
             "covariance_scale": args.covariance_scale,
             "wrap_min": args.wrap_min,
             "wrap_max": args.wrap_max,

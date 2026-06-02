@@ -90,7 +90,7 @@ cp best.tim harmonic.tim.in
 
 # Loop over any .FT or .FTp files in the harmonic directory.
 # There may be symlinks from .FT to .FTp (or the other way around), so we want to make sure that we find the "real" files and not just the symlinks.
-for hfile in $(find "$harmonic_dir" -type f \( -name "*.FT" -o -name "*.FTp" \) -print | sort) ; do
+for hfile in $(find "$harmonic_dir" -type f \( -name "J??????_??????.FT" -o -name "J??????_??????.FTp" \) -print | sort) ; do
     stem=$(basename "$hfile")
     if [[ "$stem" == *.FTp ]]; then
         stem="${stem%.FTp}"
