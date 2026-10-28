@@ -82,14 +82,22 @@ for psr in "${pulsars[@]}" ; do
                         days=leap?366:365;
                         printf "%.2f\n", year + (doy-1)/days;
                         }')
-        new_data=false
+        new_data="Good"
         extra_time="0"
         if (( $(echo "$last_obs_fracyear > $last_year" | bc -l) )); then
-            new_data=true
+            new_data="NewData"
             extra_time=$(printf "%.1f" $(echo "$last_obs_fracyear - $last_year" | bc -l))
+            manual_status=$(python3 "$scriptdir/manual_followup.py" "$psr") || exit $?
+            if [[ "$manual_status" == *"manual_active"* ]] ; then
+            new_data="Block:Manual"
+            fi
+            postponed_status=$(python3 "$scriptdir/postponed_followup.py" "$psr") || exit $?
+            if [[ "$postponed_status" == *"postponed_active"* ]] ; then
+                new_data="Block:Postponed"
+            fi
         fi
-        
     fi
+    total_years=$(echo "$last_year - $first_year" | bc -l)
 
-    printf "%-10s %-6s %-6s %-6s %-6s\n" "$psr" "$first_last_year" "$last_obs_fracyear" "$extra_time" "$new_data"
+    printf "%-10s %-4.1f %-6s %-6s %-6s %-6s\n" "$psr" "$total_years" "$first_last_year" "$last_obs_fracyear" "$extra_time" "$new_data"
 done

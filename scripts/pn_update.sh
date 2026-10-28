@@ -137,6 +137,13 @@ report_processing_error() {
     fi
 }
 
+get_mtime_epoch() {
+    local path="$1"
+
+    # Support both GNU stat (-c) and BSD/macOS stat (-f).
+    stat -c %Y "$path" 2>/dev/null || stat -f %m "$path" 2>/dev/null
+}
+
 if [[ "$clear_manual_flag" == "1" ]]; then
     echo "Clearing manual follow-up status for $pulsar_name"
     "$scriptdir/manual_followup.py" --clear "$pulsar_name"
@@ -206,6 +213,10 @@ done
 
 # get and scrunch the roach data
 for f in ../data_dir/roach/2???*.ft ; do
+    if [[ "$f" == *_sp* ]] ; then
+        echo "Skipping sp file $f"
+        continue
+    fi
     l=$(basename $f .ft)
     if [[ -e bad.list ]] && grep -q "${l}" bad.list ; then
         reason=$(grep "${l}" bad.list)
@@ -216,11 +227,21 @@ for f in ../data_dir/roach/2???*.ft ; do
         newf=ROACH_${l}.FT
         # check if a file exists like ${newf} or ${l}_h*.FT
         if [[ ! -e $newf ]] && ! compgen -G "ROACH_${l}_harmonic_*.FT" > /dev/null ; then
+            # Reuse existing scrunched file when it exists and is not older than the source by >10 minutes.
+            ftpcf_epoch=""
+            ft_epoch=""
             if [[ -e ${f%.ft}.FTp_cf ]] ; then
+                ftpcf_epoch=$(get_mtime_epoch "${f%.ft}.FTp_cf")
+                ft_epoch=$(get_mtime_epoch "$f")
+            fi
+            # Allow up to 10 minutes of timestamp skew between source and scrunched files.
+            if [[ -n "$ftpcf_epoch" ]] && [[ -n "$ft_epoch" ]] && (( ftpcf_epoch + 600 >= ft_epoch )); then
+                echo "Using existing scrunched file ${f%.ft}.FTp_cf for $f"
                 ln -s ${f%.ft}.FTp_cf $newf
             else
-                pam -FTp -u . -e FTnew $f
-                mv ${l}.FTnew $newf
+                echo "Scrunching $f to $newf"
+                pam -FTp -u . -e FTp_cf $f
+                mv ${l}.FTp_cf $newf
             fi
         fi
     fi
@@ -262,19 +283,34 @@ if [[ -z "$last_roach" ]];  then
     newfiles_ROACH=$(ls dfb_data/ROACH_*.FT | grep -v "harmonic")
 else
     newfiles_ROACH=$(ls dfb_data/ROACH_*.FT | grep -v "harmonic" | sed "0,\\:$last_roach:d")
+    lastroach_date=$(echo "$last_roach" | sed -E 's/ROACH_([0-9]{8}_[0-9]{6}).*/\1/')
 fi
 if [[ -z "$last_roach_harmonic" ]];  then
     last_roach_harmonic=""
     newfiles_ROACH_harmonic=$(ls dfb_data/ROACH_*harmonic*.FT)
 else
     newfiles_ROACH_harmonic=$(ls dfb_data/ROACH_*harmonic*.FT | sed "0,\\:$last_roach_harmonic:d")
+    lastroach_harmonic_date=$(echo "$last_roach_harmonic" | sed -E 's/ROACH_([0-9]{8}_[0-9]{6}).*/\1/')
+    if [[ -n "$lastroach_date" && -n "$lastroach_harmonic_date" && "$lastroach_harmonic_date" > "$lastroach_date" ]]; then
+        lastroach_date="$lastroach_harmonic_date"
+    fi
 fi
+
+
+
 
 if [[ -z "$last_dfb" ]] ; then
     last_dfb='none'
     newfiles_DFB=$(ls dfb_data/J??????_??????.FT )
 else
-    newfiles_DFB=$(ls dfb_data/J??????_??????.FT  | sed "0,\\:$last_dfb:d")
+    lastdfb_date=$(echo "$last_dfb" | sed -E 's/J([0-9]{6}_[0-9]{6}).*/20\1/')
+    # If last ROACH data is more recent than last DFB, we don't need to look for DFB data
+    if [[ -n "$lastroach_date" && -n "$lastdfb_date" && "$lastroach_date" > "$lastdfb_date" ]]; then
+        echo "Skip newer DFB data because last ROACH data is more recent (last ROACH: $lastroach_date, last DFB: $lastdfb_date)"
+        newfiles_DFB=""
+    else
+        newfiles_DFB=$(ls dfb_data/J??????_??????.FT  | sed "0,\\:$last_dfb:d")
+    fi
 fi
 echo "Last DFB file: $last_dfb"
 echo "Last ROACH file: $last_roach"
@@ -492,6 +528,11 @@ if [[ -n "$newfiles_DFB" ]] || [[ -n "$newfiles_ROACH" ]]  || [[ -n "$newfiles_R
 
     grep -v -F -- "-distrust" raw_trusted.tim > trusted.tim
 
+    # Remove any observations matching entries in ../zap.list
+    if [[ -e ../zap.list ]]; then
+        grep -v -F -f ../zap.list extended.tim > extended_filtered.tim
+        mv extended_filtered.tim extended.tim
+    fi
 
     if grep -Fq "jbroach" extended.tim; then
         # Check if there are efac/equad and jump parameters for the roach in the par file

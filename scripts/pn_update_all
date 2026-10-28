@@ -1,0 +1,17 @@
+#!/bin/bash
+
+scandir="/scratch/mkeith/jbo_dataset/4_ready_for_timing/"
+
+# Find all symbolic links that have a name matching J* or B*
+psrlist=$(find $scandir -mindepth 1 -maxdepth 1 -type l -name "J*" -o -name "B*")
+# Order by modification time of best.tim in that directory, oldest first
+psrlist=$(for dir in $psrlist; do echo "$(stat -c '%Y' $dir/best.tim) $dir"; done | sort -n | cut -d' ' -f2-)
+
+for dir in $psrlist; do
+    echo "Updating $dir (last updated $(stat -c '%y' $dir/best.tim))"
+    psr=$(basename $dir)
+
+    # Run the pn_update script... but terminate if it takes longer than 3 hours to run
+    timeout 10800 pn_update.sh $psr 2>&1 |tee $dir/pn_update.log 
+done
+

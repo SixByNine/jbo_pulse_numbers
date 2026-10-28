@@ -1025,7 +1025,7 @@ def plot_diagnostics(times, phase_sigma, wrapped_phase, diagnostics, trusted_mas
     trusted_idx = np.where(trusted_mask)[0]
     if len(trusted_idx) > 0:
         ax1.scatter(times[trusted_idx], wrapped_phase[trusted_idx], 
-                   alpha=0.6, s=30, c='gray', label='trusted (wrapped)', zorder=3)
+                   alpha=0.6, s=20, c='dimgray', label='trusted (wrapped)', zorder=3)
         ax1.errorbar(times[trusted_idx], wrapped_phase[trusted_idx], 
                     yerr=phase_sigma[trusted_idx], fmt='none', 
                     ecolor='gray', alpha=0.4, zorder=2, capsize=3, capthick=1)
@@ -1037,7 +1037,7 @@ def plot_diagnostics(times, phase_sigma, wrapped_phase, diagnostics, trusted_mas
     if np.any(is_inlier):
         scatter1 = ax1.scatter(diag_times[is_inlier], diag_unwrapped[is_inlier],
                               c=diag_inliers[is_inlier], cmap='RdYlGn', vmin=0, vmax=1,
-                              s=60, edgecolors='blue', linewidths=1.5, label='new (inlier)', zorder=5)
+                              s=20, edgecolors='blue', linewidths=1.5, label='new (inlier)', zorder=5)
         ax1.errorbar(diag_times[is_inlier], diag_unwrapped[is_inlier], 
                     yerr=diag_phase_sigma[is_inlier], fmt='none', 
                     ecolor='blue', alpha=0.4, zorder=4, capsize=3, capthick=1)
@@ -1046,7 +1046,7 @@ def plot_diagnostics(times, phase_sigma, wrapped_phase, diagnostics, trusted_mas
     
     if np.any(is_outlier):
         ax1.scatter(diag_times[is_outlier], diag_unwrapped[is_outlier],
-                   marker='X', s=30, c='red', edgecolors='darkred', linewidths=2,
+                   marker='X', s=20, c='red', edgecolors='darkred', linewidths=2,
                    label='new (outlier)', zorder=6)
         ax1.errorbar(diag_times[is_outlier], diag_unwrapped[is_outlier], 
                     yerr=diag_phase_sigma[is_outlier], fmt='none', 
