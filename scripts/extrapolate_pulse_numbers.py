@@ -1087,35 +1087,83 @@ def plot_diagnostics(times, phase_sigma, wrapped_phase, diagnostics, trusted_mas
                  transform=ax1.transAxes, color='red', fontsize=10, ha='center')
     ax1.set_ylim(y_min_1, y_max_1)
 
-    # ========== Panel 2: Residuals ==========
-    # Plot residuals for new observations
-    scatter2 = ax2.scatter(diag_times[is_inlier], residuals[is_inlier],
+    # ========== Panel 2: Cubic residuals ==========
+    # Combine new data with last 1000 days of old data
+    combined_times = []
+    combined_phases = []
+    old_data_indices = []
+    
+    # Add last 1000 days of old data
+    if len(trusted_idx) > 0:
+        old_cutoff_time = times[trusted_idx].max() - 1000.0
+        old_data_mask = times[trusted_idx] >= old_cutoff_time
+        old_data_indices = trusted_idx[old_data_mask]
+        combined_times.extend(times[old_data_indices])
+        combined_phases.extend(wrapped_phase[old_data_indices])
+    
+    # Add all new data
+    combined_times.extend(diag_times)
+    combined_phases.extend(diag_unwrapped)
+    
+    combined_times = np.array(combined_times)
+    combined_phases = np.array(combined_phases)
+    
+    # Fit a cubic polynomial to the combined dataset
+    if len(combined_times) > 3:
+        poly_coeffs = np.polyfit(combined_times, combined_phases, 3)
+        cubic_fit = np.polyval(poly_coeffs, diag_times)
+        cubic_residuals = diag_unwrapped - cubic_fit
+        # Also compute residuals for old data
+        cubic_fit_old = np.polyval(poly_coeffs, times[old_data_indices]) if len(old_data_indices) > 0 else np.array([])
+        old_residuals = wrapped_phase[old_data_indices] - cubic_fit_old if len(old_data_indices) > 0 else np.array([])
+    else:
+        cubic_residuals = diag_unwrapped.copy()
+        old_residuals = np.array([])
+    
+    # Plot cubic residuals for the old observations
+    ax2.scatter(times[old_data_indices], old_residuals, c='gray', s=60, edgecolors='black', linewidths=1.5, label='trusted', zorder=5)
+    ax2.errorbar(times[old_data_indices], old_residuals, 
+                yerr=phase_sigma[old_data_indices], fmt='none', 
+                ecolor='gray', alpha=0.4, zorder=4, capsize=3, capthick=1)
+
+    # Plot cubic residuals for new observations
+    scatter2 = ax2.scatter(diag_times[is_inlier], cubic_residuals[is_inlier],
                           c=diag_inliers[is_inlier], cmap='RdYlGn', vmin=0, vmax=1,
                           s=60, edgecolors='blue', linewidths=1.5, label='new (inlier)', zorder=5)
-    ax2.errorbar(diag_times[is_inlier], residuals[is_inlier], 
+    ax2.errorbar(diag_times[is_inlier], cubic_residuals[is_inlier], 
                 yerr=diag_phase_sigma[is_inlier], fmt='none', 
                 ecolor='blue', alpha=0.4, zorder=4, capsize=3, capthick=1)
     cbar2 = plt.colorbar(scatter2, ax=ax2, pad=0.01)
     cbar2.set_label('inlier probability', fontsize=10)
     
     if np.any(is_outlier):
-        ax2.scatter(diag_times[is_outlier], residuals[is_outlier],
+        ax2.scatter(diag_times[is_outlier], cubic_residuals[is_outlier],
                    marker='X', s=30, c='red', edgecolors='darkred', linewidths=2,
                    label='new (outlier)', zorder=6)
-        ax2.errorbar(diag_times[is_outlier], residuals[is_outlier], 
+        ax2.errorbar(diag_times[is_outlier], cubic_residuals[is_outlier], 
                     yerr=diag_phase_sigma[is_outlier], fmt='none', 
                     ecolor='red', alpha=0.4, zorder=4, capsize=3, capthick=1)
-    # Add uncertainty bands in residual space (±1σ centered at 0)
-    ax2.fill_between(diag_times, -diag_pred_sigmas, diag_pred_sigmas, 
-                    color='green', alpha=0.2, label='±1σ band', zorder=2)
+    
     ax2.axhline(y=0, color='green', linestyle='--', linewidth=1.5, alpha=0.7, zorder=4)
     
     ax2.set_xlabel('time (days)', fontsize=11)
-    ax2.set_ylabel('residual (unwrapped obs - predicted mean)', fontsize=11)
-    ax2.set_title('Residuals with Predictive Uncertainty', fontsize=12, fontweight='bold')
+    ax2.set_ylabel('residual (unwrapped obs - cubic fit)', fontsize=11)
+    ax2.set_title('Cubic Fit Residuals', fontsize=12, fontweight='bold')
     ax2.legend(loc='best', fontsize=10)
 
-    y_min_2, y_max_2 = ax2.get_ylim()
+    # Set y-axis range based on inliers and old data residuals with 10% padding
+    y_values_for_range = np.concatenate([cubic_residuals[is_inlier], old_residuals]) if len(old_residuals) > 0 else cubic_residuals[is_inlier]
+    if len(y_values_for_range) > 0:
+        y_range_min = np.min(y_values_for_range)
+        y_range_max = np.max(y_values_for_range)
+        y_range = y_range_max - y_range_min
+        padding = 0.1 * y_range if y_range > 0 else 1.0
+        y_min_2 = y_range_min - padding
+        y_max_2 = y_range_max + padding
+    else:
+        y_min_2, y_max_2 = ax2.get_ylim()
+
+    # Add horizontal lines at every integer y-value in view
     if y_max_2 - y_min_2 < 1000:
         for y in range(int(np.floor (y_min_2)), int(np.ceil(y_max_2)) + 1):
             ax2.axhline(y=y, color='k', linewidth=0.5, alpha=0.12, zorder=1)
