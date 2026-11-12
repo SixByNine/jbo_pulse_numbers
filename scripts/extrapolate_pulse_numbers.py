@@ -138,6 +138,24 @@ def parse_args():
         action="store_true",
         help="include proper-motion sinusoid terms (C*t*sin(omega*t) + D*t*cos(omega*t)) in the GP parametric mean; implies --fit-pos",
     )
+    parser.add_argument(
+        "--error-threshold-multiple",
+        type=float,
+        default=10.0,
+        help="reject new observations if error exceeds this multiple of median recent ToA error AND exceeds error-threshold-phase",
+    )
+    parser.add_argument(
+        "--error-threshold-phase",
+        type=float,
+        default=0.1,
+        help="reject new observations if error exceeds this phase (fraction of pulse period) AND exceeds error-threshold-multiple",
+    )
+    parser.add_argument(
+        "--error-threshold-lookback-days",
+        type=float,
+        default=3000.0,
+        help="number of days to look back when computing median recent ToA error",
+    )
     return parser.parse_args()
 
 
@@ -175,6 +193,55 @@ def read_ephindex(ephindex_path):
             except ValueError:
                 continue
     return glitch_epochs
+
+
+def identify_error_filtered_observations(times, phase_sigma, trusted_mask, F0_hz, error_multiple=10.0, error_phase=0.1, lookback_days=3000.0):
+    """
+    Identify observations to be rejected based on error thresholds.
+    
+    An observation is rejected if BOTH:
+    1. error > error_multiple * median_recent_error (of trusted observations in lookback window)
+    2. error > error_phase * (pulse_period in phase units)
+    
+    Args:
+        times: array of observation times
+        phase_sigma: array of observation errors (in phase units)
+        trusted_mask: boolean mask of trusted observations
+        F0_hz: rotational frequency in Hz (for computing pulse period)
+        error_multiple: multiplier for median error threshold
+        error_phase: phase error threshold (fraction of pulse period)
+        lookback_days: days to look back for computing median
+    
+    Returns:
+        Boolean mask: True where observation should be filtered out
+    """
+    times = np.asarray(times, dtype=float)
+    phase_sigma = np.asarray(phase_sigma, dtype=float)
+    trusted_mask = np.asarray(trusted_mask, dtype=bool)
+    
+    filter_mask = np.zeros(len(times), dtype=bool)
+    
+    # Compute pulse period (in phase units; phase goes from 0 to 1 per period, so period_in_phase = 1.0)
+    period_in_phase = 1.0 / F0_hz if F0_hz > 0 else 1.0
+    phase_threshold = error_phase * period_in_phase
+    
+    # Identify recent trusted observations
+    if np.any(trusted_mask):
+        max_time = np.max(times)
+        lookback_time = max_time - lookback_days
+        recent_trusted_indices = np.where(trusted_mask & (times >= lookback_time))[0]
+        
+        if len(recent_trusted_indices) > 0:
+            median_error = np.median(phase_sigma[recent_trusted_indices])
+            error_multiple_threshold = error_multiple * median_error
+            
+            # Mark observations that exceed BOTH thresholds
+            exceeds_multiple = phase_sigma > error_multiple_threshold
+            exceeds_phase = phase_sigma > phase_threshold
+            filter_mask = exceeds_multiple & exceeds_phase
+    
+    return filter_mask
+
 
 def run_tempo2_exportres(par_path, tim_path, working_directory):
     command = [
@@ -779,6 +846,7 @@ def associate_phases(
                 "marginal_log_likelihood": aggregated_marginal,
                 "effective_sample_size": float(ess),
                 "outlier_flag": 0,
+                "error_filtered": 0,
                 "wrap_probabilities": {str(int(wrap)): float(probability) for wrap, probability in zip(wrap_options, wrap_posteriors)},
             }
         )
@@ -812,6 +880,7 @@ def write_diagnostics(rows, output_path):
         "marginal_log_likelihood",
         "effective_sample_size",
         "outlier_flag",
+        "error_filtered",
         "wrap_probabilities",
     ]
     with open(output_path, "w", newline="") as handle:
@@ -966,13 +1035,13 @@ def solve_with_constraints(all_times, wrapped_phase, phase_sigma, trusted_mask, 
 
 
 def print_summary(best_particle, diagnostics):
-    print("index time map_wrap baseline_wrap wrap_probability inlier_probability predictive_mean predictive_sigma outlier")
+    print("index time map_wrap baseline_wrap wrap_probability inlier_probability predictive_mean predictive_sigma outlier error_filtered")
     for index, row in enumerate(diagnostics, start=1):
         print(
             f"{index:5d} {row['time']:15.8f} {row['map_wrap']:8d} "
             f"{row['baseline_wrap']:16.0f} "
             f"{row['map_wrap_probability']:16.6f} {row['inlier_probability']:18.6f} "
-            f"{row['predictive_mean']:16.6f} {row['predictive_sigma']:16.6f} {row['outlier_flag']:7d}"
+            f"{row['predictive_mean']:16.6f} {row['predictive_sigma']:16.6f} {row['outlier_flag']:7d} {row.get('error_filtered', 0):14d}"
         )
     print("best_wrap_sequence", " ".join(str(value) for value in best_particle.assignments))
 
@@ -1013,6 +1082,7 @@ def plot_diagnostics(times, phase_sigma, wrapped_phase, diagnostics, trusted_mas
     diag_pred_sigmas = np.array([d["predictive_sigma"] for d in diagnostics])
     diag_inliers = np.array([d["inlier_probability"] for d in diagnostics])
     diag_outlier_flags = np.array([d["outlier_flag"] for d in diagnostics])
+    diag_error_filtered = np.array([d.get("error_filtered", 0) for d in diagnostics])
     
     # Compute unwrapped phase from persisted baseline + local wrap decision.
     diag_unwrapped = diag_wrapped + diag_baseline_wraps + diag_map_wraps
@@ -1030,10 +1100,12 @@ def plot_diagnostics(times, phase_sigma, wrapped_phase, diagnostics, trusted_mas
                     yerr=phase_sigma[trusted_idx], fmt='none', 
                     ecolor='gray', alpha=0.4, zorder=2, capsize=3, capthick=1)
     
-    # Plot new observations (color by inlier probability)
+    # Categorize new observations by outlier/error-filtered status
     is_outlier = diag_outlier_flags > 0
-    is_inlier = ~is_outlier
+    is_error_filtered = diag_error_filtered > 0
+    is_inlier = ~is_outlier & ~is_error_filtered
     
+    # Plot inliers (color by inlier probability)
     if np.any(is_inlier):
         scatter1 = ax1.scatter(diag_times[is_inlier], diag_unwrapped[is_inlier],
                               c=diag_inliers[is_inlier], cmap='RdYlGn', vmin=0, vmax=1,
@@ -1044,6 +1116,16 @@ def plot_diagnostics(times, phase_sigma, wrapped_phase, diagnostics, trusted_mas
         cbar1 = plt.colorbar(scatter1, ax=ax1, pad=0.01)
         cbar1.set_label('inlier probability', fontsize=10)
     
+    # Plot error-filtered observations (diamond marker, orange color)
+    if np.any(is_error_filtered):
+        ax1.scatter(diag_times[is_error_filtered], diag_unwrapped[is_error_filtered],
+                   marker='D', s=20, c='orange', edgecolors='darkorange', linewidths=2,
+                   label='new (error-filtered)', zorder=6)
+        ax1.errorbar(diag_times[is_error_filtered], diag_unwrapped[is_error_filtered], 
+                    yerr=diag_phase_sigma[is_error_filtered], fmt='none', 
+                    ecolor='orange', alpha=0.4, zorder=4, capsize=3, capthick=1)
+    
+    # Plot statistical outliers (X marker, red color)
     if np.any(is_outlier):
         ax1.scatter(diag_times[is_outlier], diag_unwrapped[is_outlier],
                    marker='X', s=20, c='red', edgecolors='darkred', linewidths=2,
@@ -1126,7 +1208,7 @@ def plot_diagnostics(times, phase_sigma, wrapped_phase, diagnostics, trusted_mas
                 yerr=phase_sigma[old_data_indices], fmt='none', 
                 ecolor='gray', alpha=0.4, zorder=4, capsize=3, capthick=1)
 
-    # Plot cubic residuals for new observations
+    # Plot cubic residuals for new observations (inliers with color coding)
     scatter2 = ax2.scatter(diag_times[is_inlier], cubic_residuals[is_inlier],
                           c=diag_inliers[is_inlier], cmap='RdYlGn', vmin=0, vmax=1,
                           s=60, edgecolors='blue', linewidths=1.5, label='new (inlier)', zorder=5)
@@ -1136,6 +1218,16 @@ def plot_diagnostics(times, phase_sigma, wrapped_phase, diagnostics, trusted_mas
     cbar2 = plt.colorbar(scatter2, ax=ax2, pad=0.01)
     cbar2.set_label('inlier probability', fontsize=10)
     
+    # Plot error-filtered observations (diamond marker, orange)
+    if np.any(is_error_filtered):
+        ax2.scatter(diag_times[is_error_filtered], cubic_residuals[is_error_filtered],
+                   marker='D', s=60, c='orange', edgecolors='darkorange', linewidths=2,
+                   label='new (error-filtered)', zorder=6)
+        ax2.errorbar(diag_times[is_error_filtered], cubic_residuals[is_error_filtered], 
+                    yerr=diag_phase_sigma[is_error_filtered], fmt='none', 
+                    ecolor='orange', alpha=0.4, zorder=4, capsize=3, capthick=1)
+    
+    # Plot statistical outliers (X marker, red)
     if np.any(is_outlier):
         ax2.scatter(diag_times[is_outlier], cubic_residuals[is_outlier],
                    marker='X', s=30, c='red', edgecolors='darkred', linewidths=2,
@@ -1623,6 +1715,22 @@ def main():
         frequency_mhz=frequencies_mhz,
     )
 
+    # Apply error-based filtering to mark observations with excessively large errors
+    error_filtered_mask = identify_error_filtered_observations(
+        times,
+        phase_sigma,
+        trusted_mask,
+        F0_hz,
+        error_multiple=args.error_threshold_multiple,
+        error_phase=args.error_threshold_phase,
+        lookback_days=args.error_threshold_lookback_days,
+    )
+    for i, diag in enumerate(diagnostics):
+        # Only mark new observations; trusted observations won't be in diagnostics anyway
+        observation_index = new_indices[i] if i < len(new_indices) else None
+        if observation_index is not None and error_filtered_mask[observation_index]:
+            diag["error_filtered"] = 1
+
     output_path = args.output
     if output_path is None:
         if args.output_dir:
@@ -1685,8 +1793,12 @@ def main():
     print_summary(best_particle, diagnostics)
     trusted_count = int(np.sum(trusted_mask))
     new_count = int(len(new_indices))
+    error_filtered_count = sum(1 for d in diagnostics if d.get("error_filtered", 0) > 0)
+    outlier_count = sum(1 for d in diagnostics if d.get("outlier_flag", 0) > 0)
     print(f"trusted_observations {trusted_count}")
     print(f"new_observations {new_count}")
+    print(f"error_filtered_observations {error_filtered_count}")
+    print(f"outlier_observations {outlier_count}")
     print(f"wrote_diagnostics {output_path}")
     print(f"wrote_output_tim {output_tim_path}")
 
@@ -1717,10 +1829,15 @@ def main():
             "fit_pos": bool(args.fit_pos),
             "fit_pm": bool(args.fit_pm),
             "interactive": bool(args.interactive),
+            "error_threshold_multiple": args.error_threshold_multiple,
+            "error_threshold_phase": args.error_threshold_phase,
+            "error_threshold_lookback_days": args.error_threshold_lookback_days,
         },
         "summary": {
             "trusted_observations": trusted_count,
             "new_observations": new_count,
+            "error_filtered_observations": error_filtered_count,
+            "outlier_observations": outlier_count,
             "best_wrap_sequence": best_particle.assignments,
             "best_particle_log_weight": float(best_particle.log_weight),
         },

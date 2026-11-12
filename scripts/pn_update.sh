@@ -335,7 +335,7 @@ if [[ "$last_dfb_basename" < "J24" ]] ; then
     cd $psrdir
     files=$(for i in dfb_data/J??????_??????.FT ; do d=dfb_data/$(basename $i .FT).dlyfix ; if [[ -e $d ]] ; then echo $d ; else echo $i ; fi ; done )
 
-    pat -A SIS -f tempo2 -s $std $files | sed -e "s:jbdfb:jbdfb -be jbdfb:g" > jdfb_new.tim
+    pat -A FDM -f tempo2 -s $std $files | sed -e "s:jbdfb:jbdfb -be jbdfb:g" > jdfb_new.tim
     ndly=$(grep dlyfix jdfb_new.tim | wc -l)
     if [[ $ndly -gt 0 ]] ; then
         echo "Warning... there are $ndly toas that had to have delays fixed!"
@@ -479,7 +479,7 @@ if [[ -n "$newfiles_DFB" ]] || [[ -n "$newfiles_ROACH" ]]  || [[ -n "$newfiles_R
 
 
 
-    pat -A SIS -f tempo2 -s $std $newfiles | sed -e "s:jbdfb:jbdfb -be jbdfb:g" | sed -e "s:roach:roach -be jbroach:g" | grep -v nan > updates/pat.tim
+    pat -A FDM -C snr -f tempo2 -s $std $newfiles | sed -e "s:jbdfb:jbdfb -be jbdfb:g" | sed -e "s:roach:roach -be jbroach:g" | grep -v nan > updates/pat.tim
 
     for f in $newfiles_ROACH_harmonic ; do
         harmonic_number=$(echo "$f" | sed -e 's/.*harmonic_\([0-9]\+\).FT/\1/')
@@ -494,7 +494,7 @@ if [[ -n "$newfiles_DFB" ]] || [[ -n "$newfiles_ROACH" ]]  || [[ -n "$newfiles_R
                 exit 1
             fi
         fi
-        pat -FT -A SIS -f tempo2 -s $harmonic_template $f | tail -n 1 | sed -e "s:roach:roach -be jbroach -harmonic ${harmonic_number} -tmplt $harmonic_template:g" | grep -v nan >> updates/pat.tim
+        pat -FT -A FDM -C snr -f tempo2 -s $harmonic_template $f | tail -n 1 | sed -e "s:roach:roach -be jbroach -harmonic ${harmonic_number} -tmplt $harmonic_template:g" | grep -v nan >> updates/pat.tim
     done
 
 
