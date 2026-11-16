@@ -1,0 +1,53 @@
+#!/bin/bash
+
+lim_Ntoa=50
+lim_Trun=9
+
+# Find pulsars which need to have noise models regenerate. Criteria:
+#
+# 1. Glitches in the best.par that are not in the noise file
+# 2. Number of ToAs in best.tim is lim_Ntoa more than in the noise file.
+# 3. Date of last noise run is more than lim_Trun months since the pn update.
+
+scandir="/scratch/mkeith/jbo_dataset/4_ready_for_timing/"
+default_noise_dir="enterprise_log3_sub3"
+
+for psrdir in $scandir/[JB]*; do
+    psr=$(basename "$psrdir")
+    noisedir="${psrdir}/${default_noise_dir}"
+    if [ ! -d "$noisedir" ]; then
+        echo "$psr # No noise directory for $psrdir"
+        continue
+    fi
+    if [ ! -e "${noisedir}/${psr}_run.par.final" ]; then
+        echo "$psr # No final par for $psr"
+        continue
+    fi
+
+
+    glitch_best=$(grep -c "GLF0" "${psrdir}/best.par"| wc -l)
+    glitch_noise=$(grep -c "GLF0" "${noisedir}/${psr}_run.par.final" | wc -l)
+
+    if [ "$glitch_best" -gt "$glitch_noise" ]; then
+        echo "$psr # Glitches in best.par not in noise file for $psr"
+    else
+  
+        ntoa_best=$(grep -c "^[^#]" "${psrdir}/best.tim")
+        ntoa_noise=$(grep -c "^[^#]" "${noisedir}/${psr}.tim")
+        if [ "$ntoa_best" -gt $((ntoa_noise + lim_Ntoa)) ]; then
+            echo "$psr # Number of ToAs in best.tim is more than $lim_Ntoa greater than in noise file for $psr"
+        else
+            last_noise_run=$(stat -c %Y "${noisedir}/${psr}.tim")
+            last_pn_update=$(stat -c %Y "${psrdir}/best.tim")
+            months_since_last_run=$(( (last_pn_update - last_noise_run) / (30 * 24 * 3600) ))
+            if [ "$months_since_last_run" -gt "$lim_Trun" ]; then
+                echo "$psr # Last noise run was more than $lim_Trun months ago for $psr"
+            # else
+            #     #echo "  # Noise model is up to date for $psr"
+            fi
+        fi
+
+    fi
+    
+
+done
