@@ -89,6 +89,22 @@ while [[ $# -gt 0 ]] ; do
                 psr="$1"
                 psrdir=$pulsar_base_dir/$psr
                 if [[ ! -d "$psrdir" ]]; then
+                     # See if we have been given an jname
+                     jdir="$pulsar_base_dir/../jnames/$psr"
+                     jname="$psr"
+                     if [[ -L "$jdir" ]]; then
+                         psr=$(basename $(readlink "$jdir"))
+                         psrdir=$pulsar_base_dir/$psr
+                         echo "Resolved jname $jname to pulsar directory $psrdir"
+                         echo -e "\n\n\n"
+                         echo "***********************************"
+                         echo " NOTICE this is $psr "
+                         echo "***********************************"
+                         echo -e "\n\n\n"
+                         sleep 1
+                     fi
+                fi
+                if [[ ! -d "$psrdir" ]]; then
                     echo "Pulsar directory not found: $psrdir" >&2
                     exit 2
                 fi
