@@ -1,7 +1,7 @@
 #!/bin/bash
 
-lim_Ntoa=50
-lim_Trun=9
+lim_Ntoa=30
+lim_Trun=6
 
 # Find pulsars which need to have noise models regenerate. Criteria:
 #
@@ -12,6 +12,16 @@ lim_Trun=9
 scandir="/scratch/mkeith/jbo_dataset/4_ready_for_timing/"
 default_noise_dir="enterprise_log3_sub3"
 
+# Check args -N and -T to override default limits
+while getopts "N:T:" opt; do
+    case $opt in
+        N) lim_Ntoa="$OPTARG" ;;
+        T) lim_Trun="$OPTARG" ;;
+        *) echo "Usage: $0 [-N lim_Ntoa] [-T lim_Trun]" >&2; exit 1 ;;
+    esac
+done
+
+
 for psrdir in $scandir/[JB]*; do
     psr=$(basename "$psrdir")
     noisedir="${psrdir}/${default_noise_dir}"
@@ -20,7 +30,15 @@ for psrdir in $scandir/[JB]*; do
         continue
     fi
     if [ ! -e "${noisedir}/${psr}_run.par.final" ]; then
-        echo "$psr # No final par for $psr"
+
+        parname=$(grep "PSRJ" "${psrdir}/best.par" | awk '{print $2}' | head -1)
+        if [ "$parname" != "$psr" ]; then
+            # update PSRJ in best.par to match directory name
+            sed -ioldname -e "s/^PSRJ.*/PSRJ $psr/" "${psrdir}/best.par"
+            echo "$psr # Updated PSRJ in best.par to $psr"
+        else
+            echo "$psr # No final par for $psr"
+        fi
         continue
     fi
 
@@ -32,8 +50,8 @@ for psrdir in $scandir/[JB]*; do
         echo "$psr # Glitches in best.par not in noise file for $psr"
     else
   
-        ntoa_best=$(grep -c "^[^#]" "${psrdir}/best.tim")
-        ntoa_noise=$(grep -c "^[^#]" "${noisedir}/${psr}.tim")
+        ntoa_best=$(grep -c "^[^#C]" "${psrdir}/best.tim")
+        ntoa_noise=$(grep -c "^[^#C]" "${noisedir}/${psr}.tim")
         if [ "$ntoa_best" -gt $((ntoa_noise + lim_Ntoa)) ]; then
             echo "$psr # Number of ToAs in best.tim is more than $lim_Ntoa greater than in noise file for $psr"
         else
